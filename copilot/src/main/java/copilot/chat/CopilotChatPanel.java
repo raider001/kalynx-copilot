@@ -298,10 +298,18 @@ public class CopilotChatPanel extends JPanel {
         // Re-enable auto-scroll when the user drags back to the bottom;
         // disable it when they scroll away. The programmaticScroll guard
         // prevents our own setValue() calls from toggling the flag.
+        // prevScrollMax tracks the last known maximum so we can ignore
+        // adjustment events caused by content growth (max changes without a user scroll).
+        int[] prevScrollMax = {0};
         chatScroll.getVerticalScrollBar().addAdjustmentListener(e -> {
             if (programmaticScroll) return;
             JScrollBar sb = chatScroll.getVerticalScrollBar();
-            autoScroll = sb.getValue() + sb.getVisibleAmount() >= sb.getMaximum() - 20;
+            int max = sb.getMaximum();
+            if (max != prevScrollMax[0]) {
+                prevScrollMax[0] = max;
+                return; // content grew — not a user scroll, don't touch autoScroll
+            }
+            autoScroll = sb.getValue() + sb.getVisibleAmount() >= max - 20;
         });
 
         JPanel chatWrapper = roundedWrap(chatScroll, BG, BORDER_COLOR, 12);
@@ -1070,11 +1078,63 @@ public class CopilotChatPanel extends JPanel {
     }
 
     private void appendToolResultMessage(String toolName, String result) {
+        Color hdrFg = new Color(0x88, 0x99, 0xBB);
+
         JPanel bubble = makeBubbleContainer(new Color(0x1A, 0x1A, 0x22), 8);
         JPanel inner  = makeBubbleInner(bubble);
-        String html = "<b>" + escapeHtml(toolName) + ":</b><br>"
-                + escapeHtml(result).replace("\n", "<br>");
-        inner.add(makeBubblePane(new Color(0x88, 0x99, 0xBB), 10, html));
+
+        // Scrollable content area — hidden until the user expands
+        JTextArea textArea = new JTextArea(result);
+        textArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
+        textArea.setBackground(new Color(0x12, 0x12, 0x1E));
+        textArea.setForeground(hdrFg);
+        textArea.setEditable(false);
+        textArea.setLineWrap(false);
+        textArea.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
+
+        int lineCount = (int) result.lines().count();
+        int lineH     = textArea.getFontMetrics(textArea.getFont()).getHeight();
+        int scrollH   = Math.min(20, Math.max(3, lineCount + 1)) * lineH + 18;
+
+        JScrollPane contentScroll = new JScrollPane(textArea,
+                JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED,
+                JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+        contentScroll.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, BORDER_COLOR));
+        contentScroll.setPreferredSize(new Dimension(0, scrollH));
+        contentScroll.setMaximumSize(new Dimension(Integer.MAX_VALUE, scrollH));
+        contentScroll.setAlignmentX(Component.LEFT_ALIGNMENT);
+        contentScroll.setVisible(false);
+
+        // Clickable header row — starts collapsed
+        JLabel toggleLabel = new JLabel(toolName, AllIcons.General.ArrowRight, SwingConstants.LEFT);
+        toggleLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        toggleLabel.setForeground(hdrFg);
+        toggleLabel.setIconTextGap(6);
+        toggleLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        toggleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        boolean[] expanded = {false};
+        toggleLabel.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override
+            public void mouseClicked(java.awt.event.MouseEvent e) {
+                expanded[0] = !expanded[0];
+                toggleLabel.setIcon(expanded[0] ? AllIcons.General.ArrowDown : AllIcons.General.ArrowRight);
+                contentScroll.setVisible(expanded[0]);
+                chatMessagesPanel.revalidate();
+                chatMessagesPanel.repaint();
+            }
+            @Override
+            public void mouseEntered(java.awt.event.MouseEvent e) {
+                toggleLabel.setForeground(new Color(0xAA, 0xBB, 0xDD));
+            }
+            @Override
+            public void mouseExited(java.awt.event.MouseEvent e) {
+                toggleLabel.setForeground(hdrFg);
+            }
+        });
+
+        inner.add(toggleLabel);
+        inner.add(contentScroll);
         addBubble(bubble);
     }
 

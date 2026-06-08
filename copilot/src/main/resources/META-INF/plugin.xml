@@ -64,6 +64,7 @@
         <agentTool implementation="copilot.agent.tools.ScanProblemsTool"/>
         <agentTool implementation="copilot.maven.MavenBuildTool"/>
         <agentTool implementation="copilot.gradle.GradleBuildTool"/>
+        <agentTool implementation="copilot.agent.tools.RunTestsTool"/>
         <!-- Dynamic context management -->
         <agentTool implementation="copilot.agent.tools.AddToContextTool"/>
         <agentTool implementation="copilot.agent.tools.RemoveFromContextTool"/>

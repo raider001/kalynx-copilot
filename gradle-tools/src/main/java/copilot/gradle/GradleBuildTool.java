@@ -101,11 +101,21 @@ public class GradleBuildTool implements AgentTool {
     }
 
     private static String resolveGradle(File projectDir) {
-        boolean isWindows = System.getProperty("os.name", "").toLowerCase().contains("win");
-        String wrapper = isWindows ? "gradlew.bat" : "gradlew";
-        File wrapperFile = new File(projectDir, wrapper);
-        if (wrapperFile.exists()) return wrapperFile.getAbsolutePath();
-        return "gradle"; // fall back to system PATH
+        boolean win = System.getProperty("os.name", "").toLowerCase().contains("win");
+
+        // Prefer the project wrapper
+        File wrapper = new File(projectDir, win ? "gradlew.bat" : "gradlew");
+        if (wrapper.exists()) return wrapper.getAbsolutePath();
+
+        // Try GRADLE_HOME environment variable
+        String gradleHome = System.getenv("GRADLE_HOME");
+        if (gradleHome != null && !gradleHome.isBlank()) {
+            File candidate = new File(gradleHome, win ? "bin/gradle.bat" : "bin/gradle");
+            if (candidate.exists()) return candidate.getAbsolutePath();
+        }
+
+        // ProcessBuilder on Windows can't resolve bare "gradle" to gradle.bat — must be explicit
+        return win ? "gradle.bat" : "gradle";
     }
 
     private static String formatResult(String tasks, ProcessRunner.Result result) {

@@ -98,11 +98,23 @@ public class MavenBuildTool implements AgentTool {
     }
 
     private static String resolveMvn(File projectDir) {
-        boolean isWindows = System.getProperty("os.name", "").toLowerCase().contains("win");
-        String wrapper = isWindows ? "mvnw.cmd" : "mvnw";
-        File wrapperFile = new File(projectDir, wrapper);
-        if (wrapperFile.exists() && wrapperFile.canExecute()) return wrapperFile.getAbsolutePath();
-        return "mvn"; // fall back to system PATH
+        boolean win = System.getProperty("os.name", "").toLowerCase().contains("win");
+
+        // Prefer the project wrapper — .exists() only, canExecute() is unreliable for .cmd on Windows
+        File wrapper = new File(projectDir, win ? "mvnw.cmd" : "mvnw");
+        if (wrapper.exists()) return wrapper.getAbsolutePath();
+
+        // Try MAVEN_HOME / M2_HOME environment variables
+        for (String envVar : new String[]{"MAVEN_HOME", "M2_HOME"}) {
+            String home = System.getenv(envVar);
+            if (home != null && !home.isBlank()) {
+                File candidate = new File(home, win ? "bin/mvn.cmd" : "bin/mvn");
+                if (candidate.exists()) return candidate.getAbsolutePath();
+            }
+        }
+
+        // ProcessBuilder on Windows can't resolve bare "mvn" to mvn.cmd — must be explicit
+        return win ? "mvn.cmd" : "mvn";
     }
 
     private static String formatResult(String goals, ProcessRunner.Result result) {

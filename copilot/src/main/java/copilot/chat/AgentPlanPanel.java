@@ -41,6 +41,7 @@ public class AgentPlanPanel extends JPanel {
 
     private final Project     project;
     private final JEditorPane planPane;
+    private final JScrollPane scroll;
 
     public AgentPlanPanel(Project project, CopilotChatPanel chatPanel) {
         this.project = project;
@@ -81,7 +82,7 @@ public class AgentPlanPanel extends JPanel {
         planPane.putClientProperty(JEditorPane.HONOR_DISPLAY_PROPERTIES, Boolean.TRUE);
         planPane.setFont(new Font("Segoe UI", Font.PLAIN, 13));
 
-        JScrollPane scroll = new JScrollPane(planPane,
+        scroll = new JScrollPane(planPane,
                 JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED,
                 JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
         scroll.setBorder(null);
@@ -100,12 +101,26 @@ public class AgentPlanPanel extends JPanel {
     private void refresh() {
         SwingUtilities.invokeLater(() -> {
             String plan = ContextManager.getInstance(project).getCurrentPlan();
-            String body = (plan == null || plan.isBlank())
-                    ? "<p style='color:#888888;'><i>No active plan — the agent will create one "
-                      + "using create_plan when starting a multi-step task.</i></p>"
-                    : MD_RENDERER.render(MD_PARSER.parse(plan));
+            boolean hasPlan = plan != null && !plan.isBlank();
+            String body = hasPlan
+                    ? MD_RENDERER.render(MD_PARSER.parse(plan))
+                    : "<p style='color:#888888;'><i>No active plan — the agent will create one "
+                      + "using create_plan when starting a multi-step task.</i></p>";
+
+            // Preserve scroll position across live updates; only reset to top when
+            // the plan is newly created (previously there was no content).
+            boolean wasEmpty = planPane.getDocument().getLength() == 0;
+            int savedScroll = scroll.getVerticalScrollBar().getValue();
+
             planPane.setText(wrapHtml(body));
-            planPane.setCaretPosition(0);
+
+            SwingUtilities.invokeLater(() -> {
+                if (wasEmpty || !hasPlan) {
+                    planPane.setCaretPosition(0);
+                } else {
+                    scroll.getVerticalScrollBar().setValue(savedScroll);
+                }
+            });
         });
     }
 

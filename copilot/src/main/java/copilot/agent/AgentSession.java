@@ -158,7 +158,8 @@ public class AgentSession {
                         new copilot.agent.tools.ReadFileTool(),
                         new copilot.agent.tools.CompileProjectTool(),
                         new copilot.agent.tools.GetIDEProblemsTool(),
-                        new copilot.agent.tools.ScanProblemsTool()
+                        new copilot.agent.tools.ScanProblemsTool(),
+                        new copilot.agent.tools.RunTestsTool()
                 ));
             }
             for (AgentTool t : tools) toolMap.put(t.getName(), t);
@@ -331,6 +332,7 @@ public class AgentSession {
                     if (!success) callback.onToolError(toolName, toolResult);
                     if (tool != null && tool.shouldShowResultInChat())
                         callback.onToolResult(toolName, toolResult);
+
                 }
 
                 // Refresh system message so the model sees the latest pinned file content
@@ -469,7 +471,11 @@ public class AgentSession {
                 - maven_build         — run Maven goals (test, package, install, etc.)
                                         only available if a pom.xml exists in the project root
                 - gradle_build         — run Gradle tasks (test, build, etc.)
-                                        only available if a build.gradle / build.gradle.kts exists""";
+                                        only available if a build.gradle / build.gradle.kts exists
+                - run_tests            — run unit tests using Maven or Gradle (auto-detected);
+                                        accepts an optional 'filter' for a specific class or method:
+                                        "MyClass", "MyClass#myMethod", or "com.example.*";
+                                        returns a per-test pass/fail breakdown with stack traces""";
     }
 
     public static String defaultDynamicContextSection() {
@@ -516,7 +522,10 @@ public class AgentSession {
                    f. Unpin milestone files, then move to the next milestone
                 4. TEST: Run compile_project after all milestones are COMPLETE.
                    If there are errors, pin only the failing file, fix it, recompile.
-                   Repeat until BUILD SUCCESSFUL.""";
+                   Repeat until BUILD SUCCESSFUL.
+                   Never call a build tool again without first making a code change —
+                   recompiling without changes will always produce the same result.
+                   If you cannot determine how to fix an error, stop and ask the user.""";
     }
 
     public static String defaultGuidelinesSection() {
@@ -543,10 +552,14 @@ public class AgentSession {
                   immediately run compile_project to verify the code compiles. Do NOT report
                   success before the build passes. Use gradle_build or maven_build only when
                   you need to run tests or produce build artefacts.
-                - When compilation fails, read every error carefully — each one includes the
-                  file path and line number. Fix the root cause in the relevant file(s), then
-                  run compile_project again to confirm the fix.
-                - Keep fixing and recompiling until BUILD SUCCESSFUL before stopping.""";
+                - When compilation fails: each error tells you the exact file and line.
+                  Pin that file, read it, make a targeted fix, then recompile.
+                  Only call compile_project after you have changed something — recompiling
+                  with no changes made will always produce the same errors.
+                - If you cannot determine how to fix a build error (e.g. missing dependency,
+                  unknown symbol, configuration issue), stop immediately and tell the user:
+                  show them the exact error, explain what you tried, and ask for guidance.
+                  Do not guess, do not retry the same build, do not loop.""";
     }
 }
 
