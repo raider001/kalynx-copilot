@@ -1,0 +1,37 @@
+<component name="ProjectRunConfigurationManager">
+  <!--
+    "Run Plugin" launches a sandboxed IntelliJ IDEA instance with the
+    Kalynx Copilot plugin loaded. Use the DEBUG button (Shift+F9) to
+    attach the debugger so you can hit breakpoints inside the plugin code.
+  -->
+  <configuration default="false"
+                 name="Run Plugin"
+                 type="GradleRunConfiguration"
+                 factoryName="Gradle">
+    <ExternalSystemSettings>
+      <option name="executionName" />
+      <option name="externalProjectPath" value="C:/Users/panda/IdeaProjects/Kalynx-Copilot" />
+      <option name="externalSystemIdString" value="GRADLE" />
+      <option name="scriptParameters" value="" />
+      <option name="taskDescriptions">
+        <list />
+      </option>
+      <option name="taskNames">
+        <list>
+          <option value="runIde" />
+        </list>
+      </option>
+      <option name="vmOptions" value="" />
+    </ExternalSystemSettings>
+    <!--
+      ExternalSystemDebugServerProcess=true means IntelliJ will
+      automatically connect the debugger to the forked IDE process,
+      so you get full breakpoint support without any manual setup.
+    -->
+    <ExternalSystemDebugServerProcess>true</ExternalSystemDebugServerProcess>
+    <ExternalSystemReattachDebugProcess>true</ExternalSystemReattachDebugProcess>
+    <DebugAllEnabled>false</DebugAllEnabled>
+    <ForceTestExec>false</ForceTestExec>
+    <method v="2" />
+  </configuration>
+</component>

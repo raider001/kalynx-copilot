@@ -1,0 +1,92 @@
+<idea-plugin>
+    <id>com.kalynx.copilot</id>
+    <name>Kalynx Copilot</name>
+    <vendor url="https://kalynx.com">Kalynx</vendor>
+
+    <description>
+        <![CDATA[
+        Kalynx Copilot — an agentic AI coding assistant powered by any OpenAI-compatible API.
+        Features a chat tool window with multi-turn conversations, tool-calling capabilities
+        (read/write files, search project, run Maven/Gradle builds), and context-aware code assistance.
+        ]]>
+    </description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.java</depends>
+
+    <!-- ── Extension point ─────────────────────────────────────────────────────
+         Third-party plugins can contribute tools to Kalynx Copilot by:
+           1. Declaring a dependency on com.kalynx.copilot
+           2. Implementing copilot.tools.api.AgentTool
+           3. Registering via <agentTool implementation="..."/> in their plugin.xml
+    ──────────────────────────────────────────────────────────────────────────── -->
+    <extensionPoints>
+        <extensionPoint name="agentTool"
+                        interface="copilot.tools.api.AgentTool"
+                        area="IDEA_APPLICATION"/>
+    </extensionPoints>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Persistent settings -->
+        <applicationService serviceImplementation="copilot.CopilotSettings"/>
+
+        <!-- Per-project staged-change review manager -->
+        <projectService serviceImplementation="copilot.review.ChangeReviewManager"/>
+
+        <!-- Per-project context file manager -->
+        <projectService serviceImplementation="copilot.context.ContextManager"/>
+
+        <!-- Chat tool window -->
+        <toolWindow id="Kalynx Copilot"
+                    secondary="false"
+                    anchor="right"
+                    canCloseContents="false"
+                    factoryClass="copilot.chat.CopilotChatToolWindowFactory"/>
+
+        <!-- Notification group -->
+        <notificationGroup id="copilot.notification.group" displayType="BALLOON"/>
+    </extensions>
+
+    <!-- ── Tool registrations ───────────────────────────────────────────────── -->
+    <extensions defaultExtensionNs="com.kalynx.copilot">
+        <!-- Core file tools -->
+        <agentTool implementation="copilot.agent.tools.GetCurrentFileTool"/>
+        <agentTool implementation="copilot.agent.tools.ReadFileTool"/>
+        <agentTool implementation="copilot.agent.tools.ListFilesTool"/>
+        <agentTool implementation="copilot.agent.tools.ReplaceInFileTool"/>
+        <agentTool implementation="copilot.agent.tools.CreateFileTool"/>
+        <agentTool implementation="copilot.agent.tools.CreatePlanTool"/>
+        <agentTool implementation="copilot.agent.tools.UpdatePlanTool"/>
+        <agentTool implementation="copilot.agent.tools.SearchInFilesTool"/>
+        <!-- Build / compile tools -->
+        <agentTool implementation="copilot.agent.tools.CompileProjectTool"/>
+        <agentTool implementation="copilot.agent.tools.GetIDEProblemsTool"/>
+        <agentTool implementation="copilot.agent.tools.ScanProblemsTool"/>
+        <agentTool implementation="copilot.maven.MavenBuildTool"/>
+        <agentTool implementation="copilot.gradle.GradleBuildTool"/>
+        <!-- Dynamic context management -->
+        <agentTool implementation="copilot.agent.tools.AddToContextTool"/>
+        <agentTool implementation="copilot.agent.tools.RemoveFromContextTool"/>
+        <agentTool implementation="copilot.agent.tools.ListContextTool"/>
+        <agentTool implementation="copilot.agent.tools.ClearContextTool"/>
+    </extensions>
+
+    <actions>
+        <!-- Settings action -->
+        <action id="copilot.settings.action"
+                class="copilot.actions.OpenCopilotSettingsAction"
+                text="Kalynx Copilot Settings..."
+                description="Configure Kalynx Copilot API endpoint and model">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+
+        <!-- Ask Copilot — right-click context menu and keyboard shortcut -->
+        <action id="copilot.ask.action"
+                class="copilot.actions.AskCopilotAction"
+                text="Ask Kalynx Copilot"
+                description="Open Copilot chat with the selected code as context">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl shift PERIOD"/>
+        </action>
+    </actions>
+</idea-plugin>
