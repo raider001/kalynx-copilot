@@ -206,6 +206,9 @@ public class SectionEditorPanel extends JPanel {
              + "code{font-family:'JetBrains Mono',monospace;font-size:12px;"
              + "color:#CE9178;background:#2D2D2D;padding:0 3px;}"
              + "del{color:#888888;}"
+             + "hr{border:none;border-top:1px solid #3A3A3A;margin:10px 0;}"
+             + "blockquote{margin:6px 0 6px 0;padding:6px 10px;"
+             + "border-left:3px solid #CE9178;background:#252525;color:#D4D4D4;}"
              + "</style></head><body>" + body + "</body></html>";
     }
 

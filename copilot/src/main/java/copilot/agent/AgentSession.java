@@ -12,8 +12,7 @@ import copilot.tools.api.AgentTool;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.LinkedHashSet;
 
 /**
  * Drives the agentic loop: sends messages to the LLM, handles tool calls,
@@ -28,6 +27,22 @@ import java.util.regex.Pattern;
 public class AgentSession {
 
     private static final int DEFAULT_MAX_ITERATIONS = 100;
+    /** Tool results larger than this are truncated before being stored in conversation history. */
+    private static final int MAX_HISTORY_RESULT_CHARS = 50_000;
+
+    /**
+     * Matches a Python or JSON code fence whose body is a single JSON object.
+     * Used by {@link #extractTextToolCalls} when the model outputs tool calls as text
+     * rather than via the OpenAI tool_calls field.
+     */
+    private static final java.util.regex.Pattern TEXT_TOOL_FENCE =
+            java.util.regex.Pattern.compile(
+                    "```(?:python|json)?\\s*\\r?\\n([\\s\\S]*?)(?:\\r?\\n)?```",
+                    java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    /** Tools that mutate state — calling one resets the duplicate-call detector. */
+    private static final Set<String> WRITE_TOOLS =
+            Set.of("replace_in_file", "create_file", "create_plan", "update_plan");
     private final Project project;
     private       String  baseSysPmt;
     private       String  modePrompt = "";
@@ -159,7 +174,8 @@ public class AgentSession {
                         new copilot.agent.tools.CompileProjectTool(),
                         new copilot.agent.tools.GetIDEProblemsTool(),
                         new copilot.agent.tools.ScanProblemsTool(),
-                        new copilot.agent.tools.RunTestsTool()
+                        new copilot.agent.tools.RunTestsTool(),
+                        new copilot.agent.tools.FinishTaskTool()
                 ));
             }
             for (AgentTool t : tools) toolMap.put(t.getName(), t);
@@ -204,6 +220,11 @@ public class AgentSession {
         } catch (Exception ignored) {} // proceed with 0 (unknown) if fetch times out or fails
 
         int lastPromptTokens = 0; // updated after each response; used to cap max_tokens
+
+        // Tracks read-only tool signatures (name + args) called since the last write.
+        // Cleared whenever a write tool (replace_in_file, create_file, etc.) is called.
+        // A repeat signature means the model is looping without making progress.
+        Set<String> callsSinceLastWrite = new LinkedHashSet<>();
 
         int iterations = 0;
         while (iterations < maxIterations) {
@@ -287,17 +308,36 @@ public class AgentSession {
                         + "reasoning models often need 32,768 or more.";
             }
 
+            // Text-based tool-call fallback: some local models (e.g. Llama 3.3 via LM Studio)
+            // embed tool calls as JSON inside Python/JSON code fences instead of using the
+            // OpenAI tool_calls field. Parse and inject them only when explicitly enabled,
+            // and only when the name matches a registered tool (safety gate).
+            boolean wasTextToolCall = false;
+            if (!message.has("tool_calls")
+                    && CopilotSettings.getInstance().getActiveAgent().parseTextToolCalls) {
+                JsonArray synthetic = extractTextToolCalls(streamedContent.toString());
+                if (synthetic != null) {
+                    message.add("tool_calls", synthetic);
+                    wasTextToolCall = true;
+                }
+            }
+
             // --- Model wants to call tools ---
             if (message.has("tool_calls")) {
                 // The streamed content was narration (e.g. "I'll look at the files…"), not the
                 // final response. Tell the UI to reclassify it as a thinking block.
                 callback.onResponseAborted();
                 String narration = streamedContent.toString().trim();
-                narration = Pattern.compile("(?s)<think>.*?</think>").matcher(narration).replaceAll("").trim();
                 if (!narration.isEmpty()) callback.onThinking(narration);
 
                 JsonArray toolCalls = message.getAsJsonArray("tool_calls");
-                history.add(ChatMessage.assistantWithToolCalls(toolCalls));
+                // For text-based tool calls, preserve the original content in history so the
+                // model sees a consistent picture of what it output on the prior turn.
+                if (wasTextToolCall && !narration.isEmpty()) {
+                    history.add(ChatMessage.assistantWithToolCalls(toolCalls, narration));
+                } else {
+                    history.add(ChatMessage.assistantWithToolCalls(toolCalls));
+                }
 
                 for (JsonElement tcElem : toolCalls) {
                     JsonObject tc       = tcElem.getAsJsonObject();
@@ -310,29 +350,83 @@ public class AgentSession {
                     String description = tool != null ? tool.getStatusMessage(args) : toolName;
                     callback.onToolStart(toolName, description);
 
+                    // --- Stuck-loop detection ---
+                    // Write tools reset the tracker; read-only tools are checked for duplicates.
                     String toolResult;
                     boolean success = true;
-                    try {
-                        if (tool == null) {
-                            toolResult = "Error: unknown tool \"" + toolName + "\"";
-                            success = false;
+                    boolean isDuplicate = false;
+
+                    if (WRITE_TOOLS.contains(toolName)) {
+                        callsSinceLastWrite.clear();
+                    } else {
+                        String sig = toolName + " " + argsStr;
+                        if (callsSinceLastWrite.contains(sig)) {
+                            isDuplicate = true;
                         } else {
-                            toolResult = tool.execute(args, project);
-                            if (toolResult != null && toolResult.startsWith("Error:")) {
-                                success = false;
-                            }
+                            callsSinceLastWrite.add(sig);
                         }
-                    } catch (Exception e) {
-                        toolResult = "Error executing " + toolName + ": " + e.getMessage();
-                        success = false;
                     }
 
-                    history.add(ChatMessage.toolResult(callId, toolName, toolResult));
+                    if (isDuplicate) {
+                        toolResult = "LOOP DETECTED: '" + toolName + "' was already called with these " +
+                                     "exact arguments since your last code change — the result will be " +
+                                     "identical to what you already received. Do not call it again.\n" +
+                                     "You must make a code change before calling this tool again.\n" +
+                                     "Required next action:\n" +
+                                     "  • Identify the specific error from the output you already received.\n" +
+                                     "  • Use replace_in_file to fix it, then re-run.\n" +
+                                     "  • If you cannot determine how to fix it, stop and explain the problem to the user.\n" +
+                                     "Do NOT call finish_task — a loop means the problem is not resolved.";
+                        success = false;
+                    } else {
+                        try {
+                            if (tool == null) {
+                                toolResult = "Error: unknown tool \"" + toolName + "\"";
+                                success = false;
+                            } else {
+                                toolResult = tool.execute(args, project);
+
+                                // --- Finish signal ---
+                                if (toolResult != null && toolResult.startsWith(
+                                        copilot.agent.tools.FinishTaskTool.FINISH_SIGNAL)) {
+                                    String summary = toolResult.substring(
+                                            copilot.agent.tools.FinishTaskTool.FINISH_SIGNAL.length()).trim();
+                                    history.add(ChatMessage.toolResult(callId, toolName, "Task marked complete."));
+                                    callback.onToolEnd(toolName, true);
+                                    history.add(ChatMessage.assistant(summary));
+                                    if (!CopilotSettings.getInstance().retainToolHistory)
+                                        history.pruneToolMessages();
+                                    return summary;
+                                }
+
+                                if (toolResult != null && toolResult.startsWith("Error:")) {
+                                    success = false;
+                                }
+                            }
+                        } catch (Exception e) {
+                            toolResult = "Error executing " + toolName + ": " + e.getMessage();
+                            success = false;
+                        }
+                    }
+
+                    // Truncate large results before storing in history to prevent context overflow.
+                    // The full result is still shown in the UI via onToolResult below.
+                    String storedResult = toolResult != null && toolResult.length() > MAX_HISTORY_RESULT_CHARS
+                            ? toolResult.substring(0, MAX_HISTORY_RESULT_CHARS)
+                              + "\n... [truncated — " + toolResult.length() + " total chars]"
+                            : toolResult;
+                    history.add(ChatMessage.toolResult(callId, toolName, storedResult));
                     callback.onToolEnd(toolName, success);
                     if (!success) callback.onToolError(toolName, toolResult);
-                    if (tool != null && tool.shouldShowResultInChat())
+                    if ("replace_in_file".equals(toolName) && success
+                            && args.has("old_code") && args.has("new_code")) {
+                        String fp = args.has("file_path") ? args.get("file_path").getAsString() : "";
+                        callback.onEditResult(fp,
+                                args.get("old_code").getAsString(),
+                                args.get("new_code").getAsString());
+                    } else if (tool != null && tool.shouldShowResultInChat()) {
                         callback.onToolResult(toolName, toolResult);
-
+                    }
                 }
 
                 // Refresh system message so the model sees the latest pinned file content
@@ -354,11 +448,7 @@ public class AgentSession {
 
             } else {
                 // --- Final text response (already streamed live) ---
-                String rawContent = streamedContent.toString();
-
-                // Strip any <think> tags that weren't caught by the reasoning callback
-                Pattern thinkPattern = Pattern.compile("(?s)<think>(.*?)</think>");
-                String content = thinkPattern.matcher(rawContent).replaceAll("").trim();
+                String content = streamedContent.toString().trim();
 
                 if (!content.isEmpty()) {
                     history.add(ChatMessage.assistant(content));
@@ -367,15 +457,93 @@ public class AgentSession {
                     return content;
                 }
 
-                // Model returned only thinking content — prompt for a visible reply.
-                if (!rawContent.isEmpty()) history.add(ChatMessage.assistant(rawContent));
-                history.add(ChatMessage.user(
-                        "Please write your final reply to the user now. " +
-                        "Summarise what you did and provide any relevant information."));
+                // Empty response with no tool calls — the model has nothing to say.
+                // Do NOT loop: that would hammer the endpoint with identical requests.
+                // This typically means the model doesn't support the tool-call format,
+                // or tool_choice is misconfigured.
+                return "⚠️ Model returned an empty response with no tool calls. "
+                     + "It may not support the configured tool format. "
+                     + "Try setting Tool Choice to 'none' in agent settings to test plain chat, "
+                     + "or switch to a model with native function-calling support.";
             }
         }
 
         return "⚠️ Agent reached the maximum iteration limit without producing a final answer.";
+    }
+
+    /**
+     * Scans {@code content} for JSON tool calls embedded in Python/JSON code fences.
+     * Accepts both Meta format {"type":"function","name":"...","parameters":{}} and
+     * the simpler {"name":"...","arguments":{}}.
+     *
+     * Safety gate: only returns calls whose "name" is a registered tool — prevents
+     * accidental matches on legitimate code examples in the model's response.
+     *
+     * @return a JsonArray of synthetic OpenAI-format tool_call objects, or null if none found.
+     */
+    private JsonArray extractTextToolCalls(String content) {
+        java.util.regex.Matcher m = TEXT_TOOL_FENCE.matcher(content);
+        JsonArray calls = new JsonArray();
+        int idx = 0;
+        while (m.find()) {
+            String body = m.group(1).trim();
+            try {
+                JsonObject obj = JsonParser.parseString(body).getAsJsonObject();
+                if (!obj.has("name")) continue;
+                String name = obj.get("name").getAsString();
+                if (!toolMap.containsKey(name)) continue;  // safety gate
+
+                JsonElement argsEl = obj.has("parameters") ? obj.get("parameters")
+                                   : obj.has("arguments")  ? obj.get("arguments")
+                                   : new JsonObject();
+                String argsStr = argsEl.isJsonObject() ? argsEl.getAsJsonObject().toString() : "{}";
+
+                JsonObject call = new JsonObject();
+                call.addProperty("id", "call_text_" + idx++);
+                call.addProperty("type", "function");
+                JsonObject func = new JsonObject();
+                func.addProperty("name", name);
+                // Only extract the first valid tool call — forces one-at-a-time execution
+                // so the model sees each result before deciding the next action.
+                func.addProperty("arguments", argsStr);
+                call.add("function", func);
+                calls.add(call);
+                break; // one at a time — model must see the result before acting again
+            } catch (Exception ignored) { /* not valid JSON — skip */ }
+        }
+        // Bare-JSON fallback: some models (e.g. Llama via LM Studio) output the tool call
+        // as a raw JSON object in content with no code fence at all.
+        if (calls.isEmpty()) {
+            String trimmed = content.trim();
+            if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+                try {
+                    JsonObject obj = JsonParser.parseString(trimmed).getAsJsonObject();
+                    // Require "type":"function" — the Llama-native tool-call marker.
+                    // This prevents misinterpreting legitimate explanatory JSON as a call.
+                    boolean isToolCall = obj.has("type")
+                            && "function".equals(obj.get("type").getAsString());
+                    if (isToolCall && obj.has("name")) {
+                        String name = obj.get("name").getAsString();
+                        if (toolMap.containsKey(name)) {
+                            JsonElement argsEl = obj.has("parameters") ? obj.get("parameters")
+                                               : obj.has("arguments")  ? obj.get("arguments")
+                                               : new JsonObject();
+                            String argsStr = argsEl.isJsonObject() ? argsEl.getAsJsonObject().toString() : "{}";
+                            JsonObject call = new JsonObject();
+                            call.addProperty("id", "call_text_" + idx);
+                            call.addProperty("type", "function");
+                            JsonObject func = new JsonObject();
+                            func.addProperty("name", name);
+                            func.addProperty("arguments", argsStr);
+                            call.add("function", func);
+                            calls.add(call);
+                        }
+                    }
+                } catch (Exception ignored) { /* not valid JSON — skip */ }
+            }
+        }
+
+        return !calls.isEmpty() ? calls : null;
     }
 
     /**
@@ -475,7 +643,11 @@ public class AgentSession {
                 - run_tests            — run unit tests using Maven or Gradle (auto-detected);
                                         accepts an optional 'filter' for a specific class or method:
                                         "MyClass", "MyClass#myMethod", or "com.example.*";
-                                        returns a per-test pass/fail breakdown with stack traces""";
+                                        returns a per-test pass/fail breakdown with stack traces
+                - finish_task          — signal that the task is fully complete and end the loop.
+                                        Call this ONLY when all milestones are COMPLETE, all tests
+                                        pass, and there is nothing left to do. Provide a summary.
+                                        Do NOT call it while there are still failures or open work.""";
     }
 
     public static String defaultDynamicContextSection() {
@@ -501,31 +673,61 @@ public class AgentSession {
 
     public static String defaultAgenticWorkflowSection() {
         return """
-                Agentic workflow — follow these phases for any multi-file task:
-                1. ANALYSE: Pin and read the files you need to understand the problem.
-                   Read broadly. You may pin multiple files during this phase.
-                2. PLAN: Once you understand the problem, call create_plan with a structured
-                   Markdown plan using this layout:
-                   - "# Technical Spike: ..." title
-                   - "**Objective:**" summary and "**Progress:** 0 / N milestones complete"
-                   - Each milestone as "## Milestone N: title", then "**Status:** NOT STARTED",
-                     "**Objective:**", "**Relevant files:**", "**Context:**",
-                     "**Exit criteria:**" checkboxes (- [ ] items)
-                   - "---" horizontal rule between each milestone
-                   This clears all pinned files and locks in the plan. Do not skip this step.
-                3. RESOLVE: Work through each milestone in order:
-                   a. Call update_plan to set the milestone to IN PROGRESS
-                   b. Pin only the files listed for that milestone (add_to_context)
-                   c. Make the required changes (replace_in_file or create_file)
-                   d. Verify exit criteria (compile_project, tests as needed)
-                   e. Call update_plan to tick checkboxes and set milestone to COMPLETE
-                   f. Unpin milestone files, then move to the next milestone
-                4. TEST: Run compile_project after all milestones are COMPLETE.
-                   If there are errors, pin only the failing file, fix it, recompile.
-                   Repeat until BUILD SUCCESSFUL.
-                   Never call a build tool again without first making a code change —
-                   recompiling without changes will always produce the same result.
-                   If you cannot determine how to fix an error, stop and ask the user.""";
+                Follow these phases for any multi-file task.
+
+                ### 1. ANALYSE
+                Pin and read the files you need to understand the problem. Read broadly — you may pin multiple files during this phase.
+
+                ### 2. PLAN
+                Once you understand the problem, call `create_plan` with a structured Markdown plan:
+                - `# Technical Spike: ...` title
+                - `**Objective:**` summary and `**Progress:** 0 / N milestones complete`
+                - Each milestone as `## Milestone N: title` with **Status**, **Objective**, **Relevant files**, **Context**, and **Exit criteria** checkboxes (`- [ ] items`)
+                - `---` horizontal rule between milestones
+
+                This clears all pinned files and locks in the plan. **Do not skip this step.**
+
+                ### 3. RESOLVE
+                Work through each milestone in order:
+
+                1. Call `update_plan` to set the milestone to **IN PROGRESS**
+                2. Pin only the files listed for that milestone (`add_to_context`)
+                3. For each individual change, follow the **inner loop** below
+                4. Once all exit-criteria checkboxes are ticked, set milestone to **COMPLETE**
+                5. Unpin milestone files, then move to the next milestone
+
+                ---
+
+                **Inner loop — repeat for each change within a milestone**
+
+                **SETUP** — Read the exact section you are about to modify. Confirm the current state — never act on assumptions.
+
+                **DETERMINE** — State the root cause this change addresses. What will you change, in which file, and why? If you cannot state the root cause clearly, read more context first.
+
+                **ACT** — Make exactly one targeted change (`replace_in_file` or `create_file`).
+
+                **TEST** — Compile or run the relevant test. Read the full output.
+
+                **REASON** — Evaluate holistically before deciding what to do next:
+                - Did this change fix the stated root cause?
+                - Does it satisfy the relevant exit criterion, or is more work needed?
+                - Could it have introduced a regression elsewhere? If yes, add an inner-loop iteration to verify.
+                - Does it still align with the milestone objective and overall plan? If not, `update_plan` before continuing.
+                - What is the single most important next action?
+
+                > **If the test FAILED:** do not immediately make another change. Re-read the output and code, revise your root-cause diagnosis. **Never go TEST → ACT without passing through REASON.**
+
+                ---
+
+                ### 4. TEST
+                Run `compile_project` after all milestones are COMPLETE. Apply the same inner loop to each fix.
+
+                - Never call a build tool again without first making a code change — recompiling without changes always produces the same result.
+                - If you cannot determine how to fix an error, **stop and ask the user**.
+
+                ### 5. FINISH
+                When all milestones are COMPLETE and all tests pass, call `finish_task` with a summary of what was done.
+                Do NOT call `finish_task` before tests pass. Do NOT keep calling tools after the task is done.""";
     }
 
     public static String defaultGuidelinesSection() {

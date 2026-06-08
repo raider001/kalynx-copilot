@@ -5,6 +5,10 @@ import com.intellij.openapi.project.Project;
 import copilot.context.ContextManager;
 import copilot.tools.api.AgentTool;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
 /**
  * Pins a file to the dynamic context so its current content appears in the
  * system message for every subsequent turn.
@@ -47,6 +51,25 @@ public class ReadFileTool implements AgentTool {
     public String execute(JsonObject params, Project project) {
         String path = params.has("path") ? params.get("path").getAsString().trim() : "";
         if (path.isEmpty()) return "Error: path is required";
-        return ContextManager.getInstance(project).addEntryForAI(path);
+
+        // Pin the file so content appears in every subsequent system message
+        String pinResult = ContextManager.getInstance(project).addEntryForAI(path);
+        if (pinResult.startsWith("Error:")) return pinResult;
+
+        // Return content immediately so the model can act without waiting for the next turn.
+        // Cap at 30 KB inline — the full file is always available via the pinned context block.
+        String basePath = project.getBasePath();
+        if (basePath == null) return pinResult;
+        try {
+            String content = Files.readString(Path.of(basePath, path), StandardCharsets.UTF_8);
+            String ext = path.contains(".") ? path.substring(path.lastIndexOf('.') + 1) : "";
+            final int MAX_INLINE = 30_000;
+            String inline = content.length() > MAX_INLINE
+                    ? content.substring(0, MAX_INLINE) + "\n... [truncated — full content is in the pinned context]"
+                    : content;
+            return pinResult + "\n\n```" + ext + "\n" + inline + "\n```";
+        } catch (Exception e) {
+            return pinResult; // fall back to pin-only if read fails
+        }
     }
 }

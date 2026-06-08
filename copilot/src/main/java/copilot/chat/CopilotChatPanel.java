@@ -26,6 +26,7 @@ import javax.swing.text.View;
 import javax.swing.text.html.HTMLEditorKit;
 import java.awt.*;
 import java.awt.datatransfer.DataFlavor;
+import java.awt.GridLayout;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
 import java.awt.geom.RoundRectangle2D;
@@ -115,19 +116,29 @@ public class CopilotChatPanel extends JPanel {
     private boolean updatingCombo = false;
 
     // Auto-scroll: follows the bottom unless the user has manually scrolled up.
-    private boolean autoScroll        = true;
+    private boolean autoScroll         = true;
     private boolean programmaticScroll = false;
+    private JPanel  jumpToBottomBar    = null;
 
     // Streaming state — final response
-    private final StringBuilder streamBuffer   = new StringBuilder();
-    private JEditorPane streamingContentPane   = null;
+    private final StringBuilder streamBuffer      = new StringBuilder();
+    private JTextArea   streamingContentPane   = null;  // live plain-text pane; replaced with markdown on finalize
     private JPanel      streamingBubble        = null;
     private JPanel      streamingBubbleInner   = null;
 
     // Streaming state — live reasoning
     private final StringBuilder streamingThinkingBuffer = new StringBuilder();
-    private JEditorPane streamingThinkingPane  = null;
+    private JTextArea   streamingThinkingPane  = null;  // live; stays as plain text after finalize
     private JPanel      streamingThinkingBubble = null;
+
+    // Chunk batching — coalesces rapid background-thread tokens into single EDT flushes
+    private final Object        chunkLock                = new Object();
+    private final StringBuilder pendingStreamChunks      = new StringBuilder();
+    private volatile boolean    streamChunkFlushPending  = false;
+
+    private final Object        thinkingChunkLock           = new Object();
+    private final StringBuilder pendingThinkingChunks       = new StringBuilder();
+    private volatile boolean    thinkingChunkFlushPending   = false;
 
     // Thinking animation
     private static final String[] SPINNER = { "|", "/", "-", "\\" };
@@ -309,11 +320,37 @@ public class CopilotChatPanel extends JPanel {
                 prevScrollMax[0] = max;
                 return; // content grew — not a user scroll, don't touch autoScroll
             }
-            autoScroll = sb.getValue() + sb.getVisibleAmount() >= max - 20;
+            boolean atBottom = sb.getValue() + sb.getVisibleAmount() >= max - 20;
+            autoScroll = atBottom;
+            if (jumpToBottomBar != null) jumpToBottomBar.setVisible(!atBottom);
         });
+
+        // Jump-to-bottom bar — shown when the user scrolls up during a live response
+        jumpToBottomBar = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 3));
+        jumpToBottomBar.setBackground(BG);
+        jumpToBottomBar.setVisible(false);
+        JLabel jumpBtn = new JLabel("↓  Jump to latest");
+        jumpBtn.setForeground(ACCENT);
+        jumpBtn.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        jumpBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        jumpBtn.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+                autoScroll = true;
+                jumpToBottomBar.setVisible(false);
+                scrollToBottom();
+            }
+            @Override public void mouseEntered(java.awt.event.MouseEvent e) { jumpBtn.setForeground(ACCENT.brighter()); }
+            @Override public void mouseExited(java.awt.event.MouseEvent e)  { jumpBtn.setForeground(ACCENT); }
+        });
+        jumpToBottomBar.add(jumpBtn);
 
         JPanel chatWrapper = roundedWrap(chatScroll, BG, BORDER_COLOR, 12);
         chatWrapper.setBorder(BorderFactory.createEmptyBorder(4, 6, 2, 6));
+
+        JPanel chatAreaPanel = new JPanel(new BorderLayout());
+        chatAreaPanel.setOpaque(false);
+        chatAreaPanel.add(chatWrapper, BorderLayout.CENTER);
+        chatAreaPanel.add(jumpToBottomBar, BorderLayout.SOUTH);
 
         // --- Bottom panel ---
         JPanel bottomPanel = new JPanel(new BorderLayout(0, 4));
@@ -458,7 +495,7 @@ public class CopilotChatPanel extends JPanel {
         // --- Vertical split: chat (top) / input (bottom) — IntelliJ native splitter ---
         com.intellij.ui.OnePixelSplitter splitPane =
                 new com.intellij.ui.OnePixelSplitter(true, 0.75f);
-        splitPane.setFirstComponent(chatWrapper);
+        splitPane.setFirstComponent(chatAreaPanel);
         splitPane.setSecondComponent(bottomPanel);
         splitPane.setHonorComponentsMinimumSize(true);
         add(splitPane, BorderLayout.CENTER);
@@ -768,7 +805,21 @@ public class CopilotChatPanel extends JPanel {
                     }
                     @Override
                     public void onThinkingChunk(String chunk) {
-                        SwingUtilities.invokeLater(() -> appendThinkingChunk(chunk));
+                        synchronized (thinkingChunkLock) {
+                            pendingThinkingChunks.append(chunk);
+                            if (!thinkingChunkFlushPending) {
+                                thinkingChunkFlushPending = true;
+                                SwingUtilities.invokeLater(() -> {
+                                    String batch;
+                                    synchronized (thinkingChunkLock) {
+                                        batch = pendingThinkingChunks.toString();
+                                        pendingThinkingChunks.setLength(0);
+                                        thinkingChunkFlushPending = false;
+                                    }
+                                    appendThinkingChunk(batch);
+                                });
+                            }
+                        }
                     }
                     @Override
                     public void onThinkingStreamEnd() {
@@ -795,13 +846,31 @@ public class CopilotChatPanel extends JPanel {
                         SwingUtilities.invokeLater(() -> appendToolResultMessage(toolName, result));
                     }
                     @Override
+                    public void onEditResult(String filePath, String oldCode, String newCode) {
+                        SwingUtilities.invokeLater(() -> appendEditResultMessage(filePath, oldCode, newCode));
+                    }
+                    @Override
                     public void onUsage(int promptTokens, int completionTokens, int contextLength) {
                         hasRealTokenData = true;
                         SwingUtilities.invokeLater(() -> updateTokenBar(promptTokens, completionTokens, contextLength));
                     }
                     @Override
                     public void onResponseChunk(String chunk) {
-                        SwingUtilities.invokeLater(() -> appendStreamChunk(chunk));
+                        synchronized (chunkLock) {
+                            pendingStreamChunks.append(chunk);
+                            if (!streamChunkFlushPending) {
+                                streamChunkFlushPending = true;
+                                SwingUtilities.invokeLater(() -> {
+                                    String batch;
+                                    synchronized (chunkLock) {
+                                        batch = pendingStreamChunks.toString();
+                                        pendingStreamChunks.setLength(0);
+                                        streamChunkFlushPending = false;
+                                    }
+                                    appendStreamChunk(batch);
+                                });
+                            }
+                        }
                     }
                     @Override
                     public void onResponseAborted() {
@@ -838,6 +907,16 @@ public class CopilotChatPanel extends JPanel {
         stopThinkingAnimation();
         sendButton.setText("Send");
         sendButton.setToolTipText("Send message (Ctrl+Enter) — click again to stop");
+        if (jumpToBottomBar != null) jumpToBottomBar.setVisible(false);
+        // Drain any pending chunk batches so no stale tokens bleed into the next request
+        synchronized (chunkLock) {
+            pendingStreamChunks.setLength(0);
+            streamChunkFlushPending = false;
+        }
+        synchronized (thinkingChunkLock) {
+            pendingThinkingChunks.setLength(0);
+            thinkingChunkFlushPending = false;
+        }
         persistSessions();
     }
 
@@ -894,20 +973,27 @@ public class CopilotChatPanel extends JPanel {
     // Streaming display
     // ------------------------------------------------------------------
 
-    private void appendStreamChunk(String chunk) {
-        streamBuffer.append(chunk);
+    private void appendStreamChunk(String batch) {
+        streamBuffer.append(batch);
         if (streamingBubble == null) {
-            // First chunk — create the live bubble
-            streamingContentPane = makeBubblePane(ASSISTANT_FG, 12);
+            // First chunk — create a plain JTextArea for smooth incremental display.
+            // finalizeStream() replaces it with the full markdown component when done.
+            streamingContentPane = new JTextArea();
+            streamingContentPane.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+            streamingContentPane.setForeground(ASSISTANT_FG);
+            streamingContentPane.setBackground(ASSISTANT_BG);
+            streamingContentPane.setOpaque(false);
+            streamingContentPane.setEditable(false);
+            streamingContentPane.setLineWrap(true);
+            streamingContentPane.setWrapStyleWord(true);
+            streamingContentPane.setAlignmentX(Component.LEFT_ALIGNMENT);
             streamingBubble = makeBubbleContainer(ASSISTANT_BG, 14);
             streamingBubbleInner = makeBubbleInner(streamingBubble);
             streamingBubbleInner.add(makeBubbleHeader("Copilot", new Color(0xCE, 0x91, 0x78)));
             streamingBubbleInner.add(streamingContentPane);
             addBubble(streamingBubble);
         }
-        // Raw escaped text during streaming — fast, no full markdown parse
-        streamingContentPane.setText(paneHtml(toHex(ASSISTANT_FG), 12,
-                escapeHtml(streamBuffer.toString()).replace("\n", "<br>")));
+        streamingContentPane.append(batch);
         streamingBubble.revalidate();
         scrollToBottom();
     }
@@ -946,7 +1032,7 @@ public class CopilotChatPanel extends JPanel {
             return;
         }
 
-        // Replace the raw streaming pane with a fully markdown-rendered, code-block-aware component
+        // Replace the live markdown pane with the final code-block-aware component
         if (streamingBubbleInner != null && streamingContentPane != null) {
             streamingBubbleInner.remove(streamingContentPane);
             JComponent richContent = createBubbleContent(content, ASSISTANT_FG, 12);
@@ -1039,18 +1125,25 @@ public class CopilotChatPanel extends JPanel {
         addBubble(bubble);
     }
 
-    private void appendThinkingChunk(String chunk) {
-        streamingThinkingBuffer.append(chunk);
+    private void appendThinkingChunk(String batch) {
+        streamingThinkingBuffer.append(batch);
         if (streamingThinkingBubble == null) {
-            streamingThinkingPane   = makeBubblePane(STATUS_FG, 11);
+            streamingThinkingPane   = new JTextArea();
+            streamingThinkingPane.setFont(new Font("Segoe UI", Font.ITALIC, 11));
+            streamingThinkingPane.setForeground(STATUS_FG);
+            streamingThinkingPane.setBackground(new Color(0x20, 0x20, 0x20));
+            streamingThinkingPane.setOpaque(false);
+            streamingThinkingPane.setEditable(false);
+            streamingThinkingPane.setLineWrap(true);
+            streamingThinkingPane.setWrapStyleWord(true);
+            streamingThinkingPane.setAlignmentX(Component.LEFT_ALIGNMENT);
             streamingThinkingBubble = makeBubbleContainer(new Color(0x20, 0x20, 0x20), 10);
             JPanel inner = makeBubbleInner(streamingThinkingBubble);
             inner.add(makeBubbleHeader("💭 Reasoning", STATUS_FG));
             inner.add(streamingThinkingPane);
             addBubble(streamingThinkingBubble);
         }
-        streamingThinkingPane.setText(paneHtml(toHex(STATUS_FG), 11,
-                "<i>" + escapeHtml(streamingThinkingBuffer.toString()).replace("\n", "<br>") + "</i>"));
+        streamingThinkingPane.append(batch);
         streamingThinkingBubble.revalidate();
         scrollToBottom();
     }
@@ -1077,14 +1170,22 @@ public class CopilotChatPanel extends JPanel {
         addBubble(bubble);
     }
 
+    private static final int MAX_DISPLAY_RESULT_CHARS = 20_000;
+
     private void appendToolResultMessage(String toolName, String result) {
         Color hdrFg = new Color(0x88, 0x99, 0xBB);
 
         JPanel bubble = makeBubbleContainer(new Color(0x1A, 0x1A, 0x22), 8);
         JPanel inner  = makeBubbleInner(bubble);
 
+        // Truncate very large results for display — full content is stored in history
+        String displayResult = result != null && result.length() > MAX_DISPLAY_RESULT_CHARS
+                ? result.substring(0, MAX_DISPLAY_RESULT_CHARS)
+                  + "\n... [display truncated — " + result.length() + " chars total]"
+                : result;
+
         // Scrollable content area — hidden until the user expands
-        JTextArea textArea = new JTextArea(result);
+        JTextArea textArea = new JTextArea(displayResult);
         textArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
         textArea.setBackground(new Color(0x12, 0x12, 0x1E));
         textArea.setForeground(hdrFg);
@@ -1092,7 +1193,7 @@ public class CopilotChatPanel extends JPanel {
         textArea.setLineWrap(false);
         textArea.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
 
-        int lineCount = (int) result.lines().count();
+        int lineCount = (int) displayResult.lines().count();
         int lineH     = textArea.getFontMetrics(textArea.getFont()).getHeight();
         int scrollH   = Math.min(20, Math.max(3, lineCount + 1)) * lineH + 18;
 
@@ -1136,6 +1237,83 @@ public class CopilotChatPanel extends JPanel {
         inner.add(toggleLabel);
         inner.add(contentScroll);
         addBubble(bubble);
+    }
+
+    private void appendEditResultMessage(String filePath, String oldCode, String newCode) {
+        Color hdrFg    = new Color(0x88, 0x99, 0xBB);
+        Color removeBg = new Color(0x3A, 0x14, 0x14);
+        Color removeFg = new Color(0xFF, 0xA0, 0xA0);
+        Color addBg    = new Color(0x14, 0x2A, 0x14);
+        Color addFg    = new Color(0x9C, 0xE5, 0x9C);
+
+        JPanel bubble = makeBubbleContainer(new Color(0x1A, 0x1A, 0x22), 8);
+        JPanel inner  = makeBubbleInner(bubble);
+
+        int oldLines = oldCode.split("\n", -1).length;
+        int newLines = newCode.split("\n", -1).length;
+        String delta = newLines > oldLines ? "+" + (newLines - oldLines)
+                     : newLines < oldLines ? "-" + (oldLines - newLines)
+                     : "±0";
+        String label = filePath.isEmpty() ? "replace_in_file" : filePath + "  (" + delta + ")";
+
+        // Side-by-side diff panel — hidden until expanded
+        JPanel diffPanel = new JPanel(new GridLayout(1, 2, 4, 0));
+        diffPanel.setOpaque(false);
+        diffPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        diffPanel.setVisible(false);
+
+        diffPanel.add(makeDiffPane("Before", oldCode, removeBg, removeFg));
+        diffPanel.add(makeDiffPane("After",  newCode, addBg,    addFg));
+
+        int lineH   = new JTextArea().getFontMetrics(new Font(Font.MONOSPACED, Font.PLAIN, 11)).getHeight();
+        int maxVis  = Math.min(20, Math.max(oldLines, newLines) + 2);
+        int panelH  = maxVis * lineH + 24;
+        diffPanel.setPreferredSize(new Dimension(0, panelH));
+        diffPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, panelH));
+
+        // Clickable header
+        JLabel toggleLabel = new JLabel(label, AllIcons.General.ArrowRight, SwingConstants.LEFT);
+        toggleLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        toggleLabel.setForeground(hdrFg);
+        toggleLabel.setIconTextGap(6);
+        toggleLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        toggleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        boolean[] expanded = {false};
+        toggleLabel.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+                expanded[0] = !expanded[0];
+                toggleLabel.setIcon(expanded[0] ? AllIcons.General.ArrowDown : AllIcons.General.ArrowRight);
+                diffPanel.setVisible(expanded[0]);
+                chatMessagesPanel.revalidate();
+                chatMessagesPanel.repaint();
+            }
+            @Override public void mouseEntered(java.awt.event.MouseEvent e) { toggleLabel.setForeground(new Color(0xAA, 0xBB, 0xDD)); }
+            @Override public void mouseExited(java.awt.event.MouseEvent e)  { toggleLabel.setForeground(hdrFg); }
+        });
+
+        inner.add(toggleLabel);
+        inner.add(diffPanel);
+        addBubble(bubble);
+    }
+
+    private static JScrollPane makeDiffPane(String title, String code, Color bg, Color fg) {
+        JTextArea area = new JTextArea(code);
+        area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
+        area.setBackground(bg);
+        area.setForeground(fg);
+        area.setEditable(false);
+        area.setLineWrap(false);
+        area.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
+
+        JScrollPane scroll = new JScrollPane(area,
+                JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED,
+                JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+        scroll.setBorder(BorderFactory.createTitledBorder(
+                BorderFactory.createLineBorder(BORDER_COLOR), title,
+                javax.swing.border.TitledBorder.LEFT, javax.swing.border.TitledBorder.TOP,
+                new Font("Segoe UI", Font.PLAIN, 10), fg));
+        return scroll;
     }
 
     private void appendSystemMessage(String text) {

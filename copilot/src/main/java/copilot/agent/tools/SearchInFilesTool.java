@@ -100,7 +100,7 @@ public class SearchInFilesTool implements AgentTool {
 
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                if (results.size() >= 100) return FileVisitResult.TERMINATE;
+                if (results.size() >= 100) return FileVisitResult.CONTINUE;
 
                 String fileName = file.getFileName().toString();
                 if (extension != null && !fileName.toLowerCase().endsWith("." + extension)) {

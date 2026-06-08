@@ -44,6 +44,13 @@ public class ChatMessage {
         return msg;
     }
 
+    /** Assistant message with both tool-call requests and text content (e.g. text-based tool calls). */
+    public static ChatMessage assistantWithToolCalls(JsonArray toolCalls, String content) {
+        ChatMessage msg = new ChatMessage(Role.ASSISTANT, content);
+        msg.toolCalls = toolCalls;
+        return msg;
+    }
+
     /** Tool result message returned after executing a tool call. */
     public static ChatMessage toolResult(String toolCallId, String toolName, String content) {
         ChatMessage msg = new ChatMessage(Role.TOOL, content);
@@ -73,6 +80,10 @@ public class ChatMessage {
 
         if (role == Role.TOOL) {
             json.addProperty("tool_call_id", toolCallId != null ? toolCallId : "");
+            // Include name so LM Studio / local models can reconstruct the conversation format
+            if (toolName != null && !toolName.isEmpty()) {
+                json.addProperty("name", toolName);
+            }
         }
 
         return json;

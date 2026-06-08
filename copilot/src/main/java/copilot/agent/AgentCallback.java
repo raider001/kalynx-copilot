@@ -71,6 +71,16 @@ public interface AgentCallback {
     default void onToolResult(String toolName, String result) {}
 
     /**
+     * A {@code replace_in_file} edit was applied successfully.
+     * Provides the structured before/after content so the UI can render a diff view.
+     *
+     * @param filePath relative file path that was edited
+     * @param oldCode  the exact text that was replaced
+     * @param newCode  the replacement text
+     */
+    default void onEditResult(String filePath, String oldCode, String newCode) {}
+
+    /**
      * Called for each streamed text chunk of the final assistant response.
      * The UI should append this to a live "typing" buffer.
      */

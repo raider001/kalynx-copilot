@@ -87,6 +87,7 @@ public class RunTestsTool implements AgentTool {
         if (filter != null) cmd.add("-Dtest=" + filter);
         cmd.add("--batch-mode");
 
+        long startTime = System.currentTimeMillis();
         ProcessRunner.Result result = ProcessRunner.run(cmd.toArray(String[]::new), projectDir, TIMEOUT_SECONDS);
         if (result.timedOut())
             return "Error: Tests timed out after " + TIMEOUT_SECONDS + " seconds.";
@@ -94,7 +95,8 @@ public class RunTestsTool implements AgentTool {
         return formatResults(
                 "mvn test" + (filter != null ? " -Dtest=" + filter : ""),
                 result,
-                new File(projectDir, "target/surefire-reports"));
+                new File(projectDir, "target/surefire-reports"),
+                startTime);
     }
 
     private static String resolveMvn(File dir) {
@@ -126,8 +128,10 @@ public class RunTestsTool implements AgentTool {
             cmd.add(filter.replace('#', '.'));   // MyClass#method → MyClass.method
         }
         cmd.add("--console=plain");
-        cmd.add("--continue");  // collect all failures, not just the first
+        // Note: --continue is intentionally omitted — it causes Gradle to run stale
+        // compiled classes when compilation fails, producing misleading test results.
 
+        long startTime = System.currentTimeMillis();
         ProcessRunner.Result result = ProcessRunner.run(cmd.toArray(String[]::new), projectDir, TIMEOUT_SECONDS);
         if (result.timedOut())
             return "Error: Tests timed out after " + TIMEOUT_SECONDS + " seconds.";
@@ -135,7 +139,8 @@ public class RunTestsTool implements AgentTool {
         return formatResults(
                 "gradle test" + (filter != null ? " --tests " + filter : ""),
                 result,
-                new File(projectDir, "build/test-results/test"));
+                new File(projectDir, "build/test-results/test"),
+                startTime);
     }
 
     private static String resolveGradle(File dir) {
@@ -156,11 +161,30 @@ public class RunTestsTool implements AgentTool {
 
     // ── Result formatting ─────────────────────────────────────────────────────
 
-    private static String formatResults(String command, ProcessRunner.Result result, File reportsDir) {
-        List<TestCase> tests = parseXmlReports(reportsDir);
+    private static String formatResults(String command, ProcessRunner.Result result,
+                                        File reportsDir, long startTime) {
+        // Only read XML reports written during this run — stale reports from a previous
+        // run must be ignored, otherwise a compile failure silently returns old results.
+        List<TestCase> tests = parseXmlReports(reportsDir, startTime);
         if (!tests.isEmpty())
             return formatFromXml(command, tests);
+
+        // No fresh reports: compilation probably failed. Surface it clearly.
+        String output = result.combined();
+        if (result.exitCode() != 0 && isCompileFailure(output)) {
+            return "COMPILATION FAILED — tests were not run.\n\n" + output;
+        }
         return formatFromConsole(command, result);
+    }
+
+    private static boolean isCompileFailure(String output) {
+        String lower = output.toLowerCase();
+        return lower.contains("compilation failed")
+            || lower.contains("compilation error")
+            || lower.contains("cannot find symbol")
+            || lower.contains("error: ")
+            || lower.contains("> task :compiletestjava failed")
+            || lower.contains("[error]");
     }
 
     private static String formatFromXml(String command, List<TestCase> tests) {
@@ -227,12 +251,16 @@ public class RunTestsTool implements AgentTool {
         }
     }
 
-    private static List<TestCase> parseXmlReports(File reportsDir) {
+    private static List<TestCase> parseXmlReports(File reportsDir, long startTime) {
         List<TestCase> results = new ArrayList<>();
         if (reportsDir == null || !reportsDir.isDirectory()) return results;
 
+        // Require a 2-second grace window to handle filesystem timestamp granularity.
+        // Any report older than this was written by a previous run and must be ignored.
+        long cutoff = startTime - 2_000;
         File[] xmlFiles = reportsDir.listFiles(
-                f -> f.getName().startsWith("TEST-") && f.getName().endsWith(".xml"));
+                f -> f.getName().startsWith("TEST-") && f.getName().endsWith(".xml")
+                     && f.lastModified() >= cutoff);
         if (xmlFiles == null) return results;
 
         DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();

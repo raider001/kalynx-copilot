@@ -6,6 +6,10 @@ import com.intellij.openapi.project.Project;
 import copilot.context.ContextManager;
 import copilot.tools.api.AgentTool;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
 /**
  * Pins a file or folder to the AI dynamic context.
  * A stripped (public-signature) snapshot is written to
@@ -57,6 +61,24 @@ public class AddToContextTool implements AgentTool {
     public String execute(JsonObject params, Project project) {
         String path = params.has("path") ? params.get("path").getAsString().trim() : "";
         if (path.isEmpty()) return "Error: path is required";
-        return ContextManager.getInstance(project).addEntryForAI(path);
+
+        String pinResult = ContextManager.getInstance(project).addEntryForAI(path);
+        if (pinResult.startsWith("Error:")) return pinResult;
+
+        String basePath = project.getBasePath();
+        if (basePath == null) return pinResult;
+        try {
+            Path abs = Path.of(basePath, path);
+            if (Files.isDirectory(abs)) return pinResult;
+            String content = Files.readString(abs, StandardCharsets.UTF_8);
+            String ext = path.contains(".") ? path.substring(path.lastIndexOf('.') + 1) : "";
+            final int MAX_INLINE = 30_000;
+            String inline = content.length() > MAX_INLINE
+                    ? content.substring(0, MAX_INLINE) + "\n... [truncated — full content is in the pinned context]"
+                    : content;
+            return pinResult + "\n\n```" + ext + "\n" + inline + "\n```";
+        } catch (Exception e) {
+            return pinResult;
+        }
     }
 }

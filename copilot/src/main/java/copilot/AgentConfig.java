@@ -40,6 +40,23 @@ public class AgentConfig {
      */
     public int requestTimeoutSeconds = 300;
 
+    /**
+     * Controls whether the model must call a tool on each turn.
+     * "auto"     — model decides (default, works for all models)
+     * "required" — model must always call a tool (useful for models that plan but don't act)
+     * "none"     — tools are listed but the model may not call them
+     */
+    public String toolChoice = "auto";
+
+    /**
+     * When true, tool calls embedded in Python/JSON code fences are parsed as real tool calls.
+     * Enable for local models (e.g. Llama 3.3 via LM Studio) that output tool calls as text
+     * rather than using the OpenAI tool_calls JSON field.
+     * Only matches fences whose JSON "name" field is a registered tool name — safe against
+     * accidental matches on legitimate code examples.
+     */
+    public boolean parseTextToolCalls = false;
+
     /** Required by IntelliJ's XML serializer. */
     public AgentConfig() {}
 
@@ -58,6 +75,8 @@ public class AgentConfig {
         c.maxIterations = maxIterations;
         c.maxOutputTokens = maxOutputTokens;
         c.requestTimeoutSeconds = requestTimeoutSeconds;
+        c.toolChoice = toolChoice;
+        c.parseTextToolCalls = parseTextToolCalls;
         return c;
     }
 

@@ -215,20 +215,24 @@ public class CopilotUtil {
         for (ChatMessage msg : messages) messagesArray.add(msg.toJson());
         requestBody.add("messages", messagesArray);
 
-        if (tools != null && !tools.isEmpty()) {
+        boolean includeTools = tools != null && !tools.isEmpty();
+        if (includeTools) {
             JsonArray toolsArray = new JsonArray();
             for (AgentTool tool : tools) toolsArray.add(tool.toToolDefinition());
             requestBody.add("tools", toolsArray);
-            requestBody.addProperty("tool_choice", "auto");
+            String tc = settings.getActiveAgent().toolChoice;
+            requestBody.addProperty("tool_choice", (tc != null && !tc.isBlank()) ? tc : "auto");
         }
 
         requestBody.addProperty("temperature", 0.3);
         requestBody.addProperty("max_tokens", maxTokens);
         requestBody.addProperty("stream", true);
-        // Ask the server to include usage in the final chunk (supported by most OpenAI-compat servers)
-        JsonObject streamOptions = new JsonObject();
-        streamOptions.addProperty("include_usage", true);
-        requestBody.add("stream_options", streamOptions);
+        // stream_options is OpenAI-specific; Mistral/Codestral rejects it with HTTP 400
+        if (!isMistralEndpoint(settings.getApiEndpoint())) {
+            JsonObject streamOptions = new JsonObject();
+            streamOptions.addProperty("include_usage", true);
+            requestBody.add("stream_options", streamOptions);
+        }
         // For Ollama: override num_ctx so it actually allocates the model's full context window.
         // Without this Ollama defaults to 2048 or 16384 regardless of model capability.
         if (contextWindowHint > 0 && isOllamaEndpoint(settings.getApiEndpoint())) {
@@ -246,8 +250,7 @@ public class CopilotUtil {
         JsonObject[] usage        = {null};
         String[]     role         = {"assistant"};
 
-        streamSSE(settings.getApiEndpoint(), settings.getApiKey(), requestBody.toString(),
-                dataLine -> {
+        Consumer<String> dataHandler = dataLine -> {
                     if (isCancelled.getAsBoolean()) return;
                     JsonObject chunk;
                     try { chunk = JsonParser.parseString(dataLine).getAsJsonObject(); }
@@ -309,7 +312,9 @@ public class CopilotUtil {
                             }
                         }
                     }
-                });
+                };
+
+        streamSSE(settings.getApiEndpoint(), settings.getApiKey(), requestBody.toString(), dataHandler);
 
         // Build a response object that mirrors the non-streaming shape
         JsonObject message = new JsonObject();
@@ -345,7 +350,11 @@ public class CopilotUtil {
         return endpoint.contains(":11434") || endpoint.contains("/api/chat") || endpoint.contains("/api/generate");
     }
 
-    private static void streamSSE(String endpoint, String apiKey, String body,
+    private static boolean isMistralEndpoint(String endpoint) {
+        return endpoint.contains("mistral.ai") || endpoint.contains("codestral.mistral");
+    }
+
+private static void streamSSE(String endpoint, String apiKey, String body,
                                    Consumer<String> lineHandler) throws IOException {
         URL url = new URL(endpoint);
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
@@ -365,8 +374,20 @@ public class CopilotUtil {
             }
 
             int code = connection.getResponseCode();
-            if (code != HttpURLConnection.HTTP_OK)
-                throw new IOException("HTTP " + code);
+            if (code != HttpURLConnection.HTTP_OK) {
+                String errBody = "";
+                InputStream errStream = connection.getErrorStream();
+                if (errStream != null) {
+                    try (BufferedReader br = new BufferedReader(
+                            new InputStreamReader(errStream, StandardCharsets.UTF_8))) {
+                        StringBuilder sb = new StringBuilder();
+                        String line;
+                        while ((line = br.readLine()) != null) sb.append(line);
+                        errBody = sb.toString();
+                    } catch (Exception ignored) {}
+                }
+                throw new IOException("HTTP " + code + (errBody.isEmpty() ? "" : ": " + errBody));
+            }
 
             try (BufferedReader br = new BufferedReader(
                     new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8))) {

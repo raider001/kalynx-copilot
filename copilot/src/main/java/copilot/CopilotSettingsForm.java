@@ -52,6 +52,8 @@ public class CopilotSettingsForm extends DialogWrapper {
     private JSpinner       maxIterationsSpinner;
     private JSpinner       maxOutputTokensSpinner;
     private JSpinner       requestTimeoutSpinner;
+    private JComboBox<String> toolChoiceCombo;
+    private JCheckBox      parseTextToolCallsCheckbox;
     private JCheckBox      retainToolHistoryCheckbox;
     private JCheckBox      showDynamicContextTabCheckbox;
     private JTextArea      systemPromptArea;
@@ -252,6 +254,30 @@ public class CopilotSettingsForm extends DialogWrapper {
         panel.add(maxOutputTokensSpinner, c);
         row++;
 
+        // Tool choice
+        c.gridx = 0; c.gridy = row; c.fill = NONE; c.weightx = 0; c.anchor = WEST;
+        panel.add(new JLabel("Tool Choice:"), c);
+        c.gridx = 1; c.fill = NONE; c.weightx = 0;
+        toolChoiceCombo = new JComboBox<>(new String[]{"auto", "required", "none"});
+        toolChoiceCombo.setToolTipText(
+                "auto: model decides when to call tools (default)\n" +
+                "required: model must call a tool every turn — use when it plans but won't act\n" +
+                "none: tools are sent but the model may not call them");
+        panel.add(toolChoiceCombo, c);
+        row++;
+
+        // Parse text tool calls
+        c.gridx = 0; c.gridy = row; c.gridwidth = 2; c.fill = HORIZONTAL; c.weightx = 1.0; c.anchor = WEST;
+        parseTextToolCallsCheckbox = new JCheckBox("Parse tool calls in code fences (Python/JSON tags)");
+        parseTextToolCallsCheckbox.setToolTipText(
+                "<html>Enable for local models (e.g. Llama 3.3 via LM Studio) that output tool calls<br>" +
+                "as JSON inside code fences rather than using the OpenAI tool_calls field.<br>" +
+                "Only matches fences whose JSON 'name' matches a registered tool — safe against<br>" +
+                "false positives on legitimate code examples.</html>");
+        panel.add(parseTextToolCallsCheckbox, c);
+        c.gridwidth = 1;
+        row++;
+
         // System Prompt
         c.gridx = 0; c.gridy = row; c.fill = NONE; c.weightx = 0; c.anchor = NORTHWEST;
         panel.add(new JLabel("System Prompt:"), c);
@@ -315,6 +341,8 @@ public class CopilotSettingsForm extends DialogWrapper {
         a.model              = modelField.getText().trim();
         a.maxIterations      = (Integer) maxIterationsSpinner.getValue();
         a.maxOutputTokens    = (Integer) maxOutputTokensSpinner.getValue();
+        a.toolChoice         = (String) toolChoiceCombo.getSelectedItem();
+        a.parseTextToolCalls = parseTextToolCallsCheckbox.isSelected();
         a.systemPrompt       = systemPromptArea.getText();
         // Refresh the list row label (name or model may have changed)
         listModel.set(idx, a);
@@ -330,6 +358,8 @@ public class CopilotSettingsForm extends DialogWrapper {
         modelField.setText(a.model != null ? a.model : "");
         maxIterationsSpinner.setValue(a.maxIterations > 0 ? a.maxIterations : 100);
         maxOutputTokensSpinner.setValue(a.maxOutputTokens > 0 ? a.maxOutputTokens : 16384);
+        toolChoiceCombo.setSelectedItem(a.toolChoice != null ? a.toolChoice : "auto");
+        parseTextToolCallsCheckbox.setSelected(a.parseTextToolCalls);
         systemPromptArea.setText(a.systemPrompt != null ? a.systemPrompt : "");
         setStatus(" ", Color.GRAY);
         lastEditedIndex = idx;
@@ -505,6 +535,7 @@ public class CopilotSettingsForm extends DialogWrapper {
         modelField.setEnabled(enabled);
         maxIterationsSpinner.setEnabled(enabled);
         maxOutputTokensSpinner.setEnabled(enabled);
+        parseTextToolCallsCheckbox.setEnabled(enabled);
         retainToolHistoryCheckbox.setEnabled(enabled);
         showDynamicContextTabCheckbox.setEnabled(enabled);
         systemPromptArea.setEnabled(enabled);
