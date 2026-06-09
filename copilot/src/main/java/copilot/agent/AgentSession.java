@@ -60,6 +60,10 @@ public class AgentSession {
     /** Set to {@code true} to abort the agentic loop after the current HTTP call finishes. */
     private volatile boolean cancelled = false;
 
+    /** Current compression trigger threshold (tokens). Adjusted dynamically after each compression. */
+    private int currentCompressionThreshold = 0;
+    private boolean compressionInitialized  = false;
+
     /**
      * Cancels the current request. Disconnects the in-flight HTTP connection so the
      * background thread unblocks as quickly as possible.
@@ -220,6 +224,8 @@ public class AgentSession {
         } catch (Exception ignored) {} // proceed with 0 (unknown) if fetch times out or fails
 
         int lastPromptTokens = 0; // updated after each response; used to cap max_tokens
+
+        initCompression();
 
         // Tracks read-only tool signatures (name + args) called since the last write.
         // Cleared whenever a write tool (replace_in_file, create_file, etc.) is called.
@@ -396,6 +402,7 @@ public class AgentSession {
                                     history.add(ChatMessage.assistant(summary));
                                     if (!CopilotSettings.getInstance().retainToolHistory)
                                         history.pruneToolMessages();
+                                    maybeCompress(lastPromptTokens, callback);
                                     return summary;
                                 }
 
@@ -454,6 +461,7 @@ public class AgentSession {
                     history.add(ChatMessage.assistant(content));
                     if (!CopilotSettings.getInstance().retainToolHistory)
                         history.pruneToolMessages();
+                    maybeCompress(lastPromptTokens, callback);
                     return content;
                 }
 
@@ -469,6 +477,175 @@ public class AgentSession {
         }
 
         return "⚠️ Agent reached the maximum iteration limit without producing a final answer.";
+    }
+
+    // ── Compression helpers ───────────────────────────────────────────────────
+
+    private void initCompression() {
+        if (compressionInitialized) return;
+        compressionInitialized = true;
+        currentCompressionThreshold = CopilotSettings.getInstance().getActiveAgent().compressionThresholdTokens;
+    }
+
+    /**
+     * Triggers conversation compression if {@code promptTokens} exceeds the current threshold.
+     * Saves a pre-compression snapshot, prunes old tool pairs, calls the LLM to summarize
+     * assistant turns, replaces history, then adjusts the threshold so the next compression
+     * is triggered at roughly the same relative growth above the compressed baseline.
+     */
+    private void maybeCompress(int promptTokens, AgentCallback callback) {
+        if (currentCompressionThreshold <= 0 || promptTokens < currentCompressionThreshold) return;
+
+        callback.onCompressionStarted();
+
+        String snapshotPath = saveSnapshot();
+        history.pruneOldToolPairs(20);
+
+        List<ChatMessage> compressed = callCompressionLlm();
+        if (compressed != null && !compressed.isEmpty()) {
+            history.replaceMessages(compressed);
+        }
+
+        int compressedEstimate = history.estimateContentChars() / 4;
+        // Push the next trigger to ~80% above the new compressed size — big enough to be useful,
+        // small enough to prevent runaway growth.
+        int configured = CopilotSettings.getInstance().getActiveAgent().compressionThresholdTokens;
+        currentCompressionThreshold = Math.max((int)(compressedEstimate * 1.8), configured);
+
+        callback.onCompressionDone(promptTokens, compressedEstimate, snapshotPath);
+    }
+
+    /**
+     * Saves the current conversation history to a Markdown file under
+     * {@code <project_root>/.kalynx/snapshots/}.
+     *
+     * @return the absolute path to the file, or null if saving failed
+     */
+    private String saveSnapshot() {
+        try {
+            String basePath = project.getBasePath();
+            if (basePath == null) return null;
+
+            java.io.File dir = new java.io.File(basePath, ".kalynx/snapshots");
+            dir.mkdirs();
+
+            String ts = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss").format(new java.util.Date());
+            java.io.File file = new java.io.File(dir, "snapshot_" + ts + ".md");
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("# Conversation Snapshot — ").append(ts).append("\n\n");
+            for (ChatMessage msg : history.snapshot()) {
+                if (msg.getRole() == ChatMessage.Role.SYSTEM) continue;
+                sb.append("## ").append(msg.getRole().name().toLowerCase()).append("\n\n");
+                String c = msg.getContent();
+                if (c != null && !c.isBlank()) sb.append(c).append("\n\n");
+            }
+
+            try (java.io.FileWriter fw = new java.io.FileWriter(file, java.nio.charset.StandardCharsets.UTF_8)) {
+                fw.write(sb.toString());
+            }
+            return file.getAbsolutePath();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Asks the configured LLM to compress the conversation: USER messages are kept verbatim,
+     * ASSISTANT messages are replaced with concise bullet-point summaries.
+     *
+     * @return the compressed message list, or null if the call failed or returned invalid JSON
+     */
+    private List<ChatMessage> callCompressionLlm() {
+        try {
+            StringBuilder conv = new StringBuilder();
+            for (ChatMessage msg : history.snapshot()) {
+                ChatMessage.Role role = msg.getRole();
+                if (role == ChatMessage.Role.SYSTEM || role == ChatMessage.Role.TOOL) continue;
+                String c = msg.getContent();
+                if (c == null || c.isBlank()) continue;
+                String label = msg.hasToolCalls() ? "assistant (tool call)" : role.name().toLowerCase();
+                conv.append("[").append(label).append("]\n").append(c).append("\n\n");
+            }
+            if (conv.length() == 0) return null;
+
+            String prompt =
+                "You are a conversation compressor. Compress the conversation below.\n" +
+                "Rules:\n" +
+                "  - Preserve every USER message exactly as-is.\n" +
+                "  - Replace each ASSISTANT message with 3-7 bullet points summarising facts, decisions, and actions. Resolve contradictions: newest wins.\n" +
+                "  - Drop all tool-call assistant turns entirely — they are captured in adjacent summaries.\n" +
+                "  - Return ONLY a JSON array: [{\"role\":\"user\"|\"assistant\",\"content\":\"...\"}]\n" +
+                "  - No markdown wrapper, no explanation — raw JSON only.\n\n" +
+                "Conversation:\n\n" + conv;
+
+            CopilotSettings s = CopilotSettings.getInstance();
+            String reqBody = buildCompressionRequest(s.getModel(), prompt);
+            String raw = sendCompressionRequest(s.getApiEndpoint(), s.getApiKey(), reqBody);
+            if (raw == null || raw.isBlank()) return null;
+
+            String trimmed = raw.trim();
+            if (trimmed.startsWith("```")) {
+                trimmed = trimmed.replaceFirst("^```(?:json)?\\s*\\r?\\n?", "")
+                                 .replaceFirst("\\r?\\n?```\\s*$", "").trim();
+            }
+
+            JsonArray arr = JsonParser.parseString(trimmed).getAsJsonArray();
+            List<ChatMessage> result = new ArrayList<>();
+            for (JsonElement el : arr) {
+                JsonObject obj = el.getAsJsonObject();
+                String role = obj.get("role").getAsString();
+                String content = obj.has("content") ? obj.get("content").getAsString() : "";
+                if ("user".equals(role))      result.add(ChatMessage.user(content));
+                else if ("assistant".equals(role)) result.add(ChatMessage.assistant(content));
+            }
+            return result.isEmpty() ? null : result;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String buildCompressionRequest(String model, String prompt) {
+        JsonObject body = new JsonObject();
+        body.addProperty("model", model);
+        JsonArray messages = new JsonArray();
+        JsonObject msg = new JsonObject();
+        msg.addProperty("role", "user");
+        msg.addProperty("content", prompt);
+        messages.add(msg);
+        body.add("messages", messages);
+        body.addProperty("max_tokens", 8192);
+        body.addProperty("temperature", 0.1);
+        body.addProperty("stream", false);
+        return body.toString();
+    }
+
+    private static String sendCompressionRequest(String endpoint, String apiKey,
+                                                  String body) throws java.io.IOException {
+        java.net.URL url = new java.net.URL(endpoint);
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Content-Type", "application/json");
+        if (apiKey != null && !apiKey.trim().isEmpty())
+            conn.setRequestProperty("Authorization", "Bearer " + apiKey);
+        conn.setDoOutput(true);
+        conn.setConnectTimeout(10_000);
+        conn.setReadTimeout(120_000);
+        try (java.io.OutputStream os = conn.getOutputStream()) {
+            os.write(body.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+        if (conn.getResponseCode() != java.net.HttpURLConnection.HTTP_OK) return null;
+        try (java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.InputStreamReader(conn.getInputStream(),
+                        java.nio.charset.StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line).append('\n');
+            JsonObject resp = JsonParser.parseString(sb.toString().trim()).getAsJsonObject();
+            return resp.getAsJsonArray("choices").get(0)
+                       .getAsJsonObject().getAsJsonObject("message")
+                       .get("content").getAsString();
+        }
     }
 
     /**

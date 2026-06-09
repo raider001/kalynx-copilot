@@ -57,6 +57,13 @@ public class AgentConfig {
      */
     public boolean parseTextToolCalls = false;
 
+    /**
+     * Token count at which conversation history is automatically compressed.
+     * 0 = disabled. The actual trigger threshold is adjusted dynamically based on
+     * how effectively previous compressions reduced the context size.
+     */
+    public int compressionThresholdTokens = 0;
+
     /** Required by IntelliJ's XML serializer. */
     public AgentConfig() {}
 
@@ -77,6 +84,7 @@ public class AgentConfig {
         c.requestTimeoutSeconds = requestTimeoutSeconds;
         c.toolChoice = toolChoice;
         c.parseTextToolCalls = parseTextToolCalls;
+        c.compressionThresholdTokens = compressionThresholdTokens;
         return c;
     }
 

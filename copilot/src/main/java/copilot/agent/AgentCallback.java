@@ -92,6 +92,20 @@ public interface AgentCallback {
      * The UI should clear its live buffer (the content will follow via {@link #onThinking}).
      */
     default void onResponseAborted() {}
+
+    /** The conversation history has grown past the compression threshold and is being compressed. */
+    default void onCompressionStarted() {}
+
+    /**
+     * Compression finished.
+     *
+     * @param originalTokenEstimate  approximate prompt tokens before compression
+     * @param compressedTokenEstimate approximate prompt tokens after compression
+     * @param snapshotPath           absolute path to the markdown snapshot of the original
+     *                               conversation, or null if the snapshot could not be saved
+     */
+    default void onCompressionDone(int originalTokenEstimate, int compressedTokenEstimate,
+                                   String snapshotPath) {}
 }
 
 

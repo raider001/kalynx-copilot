@@ -54,6 +54,7 @@ public class CopilotSettingsForm extends DialogWrapper {
     private JSpinner       requestTimeoutSpinner;
     private JComboBox<String> toolChoiceCombo;
     private JCheckBox      parseTextToolCallsCheckbox;
+    private JSpinner       compressionThresholdSpinner;
     private JCheckBox      retainToolHistoryCheckbox;
     private JCheckBox      showDynamicContextTabCheckbox;
     private JTextArea      systemPromptArea;
@@ -278,6 +279,17 @@ public class CopilotSettingsForm extends DialogWrapper {
         c.gridwidth = 1;
         row++;
 
+        // Compression threshold
+        c.gridx = 0; c.gridy = row; c.fill = NONE; c.weightx = 0; c.anchor = WEST;
+        panel.add(new JLabel("Compression Threshold (tokens):"), c);
+        c.gridx = 1; c.fill = NONE; c.weightx = 0;
+        compressionThresholdSpinner = new JSpinner(new SpinnerNumberModel(0, 0, 200_000, 1_000));
+        compressionThresholdSpinner.setToolTipText(
+                "<html>Automatically compress conversation history when prompt tokens exceed this value.<br>" +
+                "0 = disabled. A good starting point is 60–70% of the model's context window.</html>");
+        panel.add(compressionThresholdSpinner, c);
+        row++;
+
         // System Prompt
         c.gridx = 0; c.gridy = row; c.fill = NONE; c.weightx = 0; c.anchor = NORTHWEST;
         panel.add(new JLabel("System Prompt:"), c);
@@ -342,8 +354,9 @@ public class CopilotSettingsForm extends DialogWrapper {
         a.maxIterations      = (Integer) maxIterationsSpinner.getValue();
         a.maxOutputTokens    = (Integer) maxOutputTokensSpinner.getValue();
         a.toolChoice         = (String) toolChoiceCombo.getSelectedItem();
-        a.parseTextToolCalls = parseTextToolCallsCheckbox.isSelected();
-        a.systemPrompt       = systemPromptArea.getText();
+        a.parseTextToolCalls          = parseTextToolCallsCheckbox.isSelected();
+        a.compressionThresholdTokens  = (Integer) compressionThresholdSpinner.getValue();
+        a.systemPrompt                = systemPromptArea.getText();
         // Refresh the list row label (name or model may have changed)
         listModel.set(idx, a);
     }
@@ -360,6 +373,7 @@ public class CopilotSettingsForm extends DialogWrapper {
         maxOutputTokensSpinner.setValue(a.maxOutputTokens > 0 ? a.maxOutputTokens : 16384);
         toolChoiceCombo.setSelectedItem(a.toolChoice != null ? a.toolChoice : "auto");
         parseTextToolCallsCheckbox.setSelected(a.parseTextToolCalls);
+        compressionThresholdSpinner.setValue(a.compressionThresholdTokens);
         systemPromptArea.setText(a.systemPrompt != null ? a.systemPrompt : "");
         setStatus(" ", Color.GRAY);
         lastEditedIndex = idx;
@@ -536,6 +550,7 @@ public class CopilotSettingsForm extends DialogWrapper {
         maxIterationsSpinner.setEnabled(enabled);
         maxOutputTokensSpinner.setEnabled(enabled);
         parseTextToolCallsCheckbox.setEnabled(enabled);
+        compressionThresholdSpinner.setEnabled(enabled);
         retainToolHistoryCheckbox.setEnabled(enabled);
         showDynamicContextTabCheckbox.setEnabled(enabled);
         systemPromptArea.setEnabled(enabled);

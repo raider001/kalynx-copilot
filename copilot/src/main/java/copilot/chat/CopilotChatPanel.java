@@ -876,6 +876,17 @@ public class CopilotChatPanel extends JPanel {
                     public void onResponseAborted() {
                         SwingUtilities.invokeLater(() -> abortStream());
                     }
+                    @Override
+                    public void onCompressionStarted() {
+                        SwingUtilities.invokeLater(() ->
+                                appendSystemMessage("🗜 Compressing conversation history…"));
+                    }
+                    @Override
+                    public void onCompressionDone(int originalTokens, int compressedTokens,
+                                                  String snapshotPath) {
+                        SwingUtilities.invokeLater(() ->
+                                appendCompressionNotice(originalTokens, compressedTokens, snapshotPath));
+                    }
                 };
 
                 String response = agentSession.chat(messageToSend, callback);
@@ -1318,6 +1329,16 @@ public class CopilotChatPanel extends JPanel {
 
     private void appendSystemMessage(String text) {
         addBubble(makePlainBubble(text, STATUS_FG, BG, 11, true));
+    }
+
+    private void appendCompressionNotice(int originalTokens, int compressedTokens, String snapshotPath) {
+        int saved = originalTokens - compressedTokens;
+        int pct   = originalTokens > 0 ? (saved * 100 / originalTokens) : 0;
+        String msg = String.format(
+                "🗜 Context compressed: ~%,d → ~%,d tokens (%d%% reduction)",
+                originalTokens, compressedTokens, pct);
+        if (snapshotPath != null) msg += "  |  Snapshot: " + snapshotPath;
+        appendSystemMessage(msg);
     }
 
     // ------------------------------------------------------------------
