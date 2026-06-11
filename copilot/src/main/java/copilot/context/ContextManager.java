@@ -14,6 +14,9 @@ import com.intellij.util.messages.MessageBusConnection;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import copilot.agent.Phase;
+import copilot.agent.PhaseController;
+import copilot.memory.MemoryFact;
 import copilot.tools.api.PathGuard;
 
 import java.io.File;
@@ -43,6 +46,25 @@ public class ContextManager implements PersistentStateComponent<ContextManager.S
     private final List<Runnable>     listeners = new CopyOnWriteArrayList<>();
     private final MessageBusConnection busConn;
 
+    // ── Phase state instance fields (loaded from / saved to State) ────────────────
+    private String  currentPhaseStr          = "ANALYSE";
+    private boolean lastVerifyClean          = false;
+    private int     consecutiveFailedVerifies = 0;
+    private int     lastErrorCount           = -1;
+    private boolean hasEditedThisPhase       = false;
+    private boolean hasReadFileThisPhase     = false;
+    private final List<String>     evictedFiles = new CopyOnWriteArrayList<>();
+    private String  lastVerifyOutput         = "";
+
+    // ── Semantic memory instance fields ───────────────────────────────────────────
+    private final List<MemoryFact> memoryFacts = new CopyOnWriteArrayList<>();
+
+    // ── Model scratchpad (survives compression) ───────────────────────────────────
+    private String scratchpadNote = null;
+
+    // ── PhaseController (lazy singleton) ─────────────────────────────────────────
+    private volatile PhaseController phaseController = null;
+
     // ── Inner data classes ────────────────────────────────────────────────────────
 
     public enum Source { USER, AI }
@@ -71,6 +93,19 @@ public class ContextManager implements PersistentStateComponent<ContextManager.S
 
     public static class State {
         public List<WatchedEntry> entries = new ArrayList<>();
+        // Phase state (persisted across IDE restarts)
+        public String  currentPhase              = "ANALYSE";
+        public boolean lastVerifyClean           = false;
+        public int     consecutiveFailedVerifies = 0;
+        public int     lastErrorCount            = -1;
+        public boolean hasEditedThisPhase        = false;
+        public boolean hasReadFileThisPhase      = false;
+        public List<String> evictedFiles         = new ArrayList<>();
+        public String  lastVerifyOutput          = "";
+        // Semantic memory
+        public List<MemoryFact> memoryFacts      = new ArrayList<>();
+        // Model scratchpad
+        public String  scratchpadNote            = null;
     }
 
     // ── Construction ─────────────────────────────────────────────────────────────
@@ -101,14 +136,38 @@ public class ContextManager implements PersistentStateComponent<ContextManager.S
     @Override
     public @Nullable State getState() {
         State s = new State();
-        s.entries = new ArrayList<>(entries);
+        s.entries                 = new ArrayList<>(entries);
+        s.currentPhase            = currentPhaseStr;
+        s.lastVerifyClean          = lastVerifyClean;
+        s.consecutiveFailedVerifies = consecutiveFailedVerifies;
+        s.lastErrorCount           = lastErrorCount;
+        s.hasEditedThisPhase       = hasEditedThisPhase;
+        s.hasReadFileThisPhase     = hasReadFileThisPhase;
+        s.evictedFiles             = new ArrayList<>(evictedFiles);
+        s.lastVerifyOutput         = lastVerifyOutput;
+        s.memoryFacts              = new ArrayList<>(memoryFacts);
+        s.scratchpadNote           = scratchpadNote;
         return s;
     }
 
     @Override
     public void loadState(@NotNull State state) {
         entries.clear();
-        entries.addAll(state.entries);
+        if (state.entries != null) entries.addAll(state.entries);
+
+        currentPhaseStr           = state.currentPhase != null ? state.currentPhase : "ANALYSE";
+        lastVerifyClean            = state.lastVerifyClean;
+        consecutiveFailedVerifies  = state.consecutiveFailedVerifies;
+        lastErrorCount             = state.lastErrorCount;
+        hasEditedThisPhase         = state.hasEditedThisPhase;
+        hasReadFileThisPhase       = state.hasReadFileThisPhase;
+        evictedFiles.clear();
+        if (state.evictedFiles != null) evictedFiles.addAll(state.evictedFiles);
+        lastVerifyOutput           = state.lastVerifyOutput != null ? state.lastVerifyOutput : "";
+        memoryFacts.clear();
+        if (state.memoryFacts != null) memoryFacts.addAll(state.memoryFacts);
+        scratchpadNote             = state.scratchpadNote;
+
         // Regenerate snapshots in background — source files may have changed while IDE was closed
         ApplicationManager.getApplication().executeOnPooledThread(this::regenerateAll);
     }
@@ -229,6 +288,7 @@ public class ContextManager implements PersistentStateComponent<ContextManager.S
         entries.add(entry);
         ApplicationManager.getApplication().executeOnPooledThread(this::notifyListeners);
 
+        getPhaseController().notifyFileRead();
         String result = "Pinned: " + relativePath + " — full content is now in your dynamic context.";
 
         // Warn immediately if another pinned file shares the same filename — this is the
@@ -275,6 +335,7 @@ public class ContextManager implements PersistentStateComponent<ContextManager.S
 
         if (entry == null) return "Not found in pinned context: " + relativePath
                 + ". Use list_context to see exact pinned paths.";
+        getPhaseController().notifyEvicted(entry.relativePath);
         removeEntry(entry);
         return "Unpinned: " + entry.relativePath;
     }
@@ -292,6 +353,56 @@ public class ContextManager implements PersistentStateComponent<ContextManager.S
     /** Clears the active plan (called on session reset or explicit clear). */
     public void clearCurrentPlan() { this.currentPlan = null; notifyListeners(); }
 
+    // ── Phase state accessors ─────────────────────────────────────────────────────
+
+    public Phase getCurrentPhase() {
+        try { return Phase.valueOf(currentPhaseStr); }
+        catch (Exception e) { return Phase.ANALYSE; }
+    }
+    public void setCurrentPhase(Phase phase) { currentPhaseStr = phase.name(); notifyListeners(); }
+
+    public boolean isLastVerifyClean()                { return lastVerifyClean; }
+    public void    setLastVerifyClean(boolean v)      { lastVerifyClean = v; }
+
+    public int  getConsecutiveFailedVerifies()         { return consecutiveFailedVerifies; }
+    public void setConsecutiveFailedVerifies(int v)    { consecutiveFailedVerifies = v; }
+
+    public int  getLastErrorCount()                    { return lastErrorCount; }
+    public void setLastErrorCount(int v)               { lastErrorCount = v; }
+
+    public boolean isHasEditedThisPhase()              { return hasEditedThisPhase; }
+    public void    setHasEditedThisPhase(boolean v)    { hasEditedThisPhase = v; }
+
+    public boolean isHasReadFileThisPhase()            { return hasReadFileThisPhase; }
+    public void    setHasReadFileThisPhase(boolean v)  { hasReadFileThisPhase = v; }
+
+    public List<String> getEvictedFiles()              { return new ArrayList<>(evictedFiles); }
+    public void setEvictedFiles(List<String> list)     { evictedFiles.clear(); evictedFiles.addAll(list); }
+
+    public String getLastVerifyOutput()                { return lastVerifyOutput; }
+    public void   setLastVerifyOutput(String v)        { lastVerifyOutput = v != null ? v : ""; }
+
+    // ── Memory fact accessors ─────────────────────────────────────────────────────
+
+    public List<MemoryFact> getMemoryFacts()           { return new ArrayList<>(memoryFacts); }
+    public void saveMemoryFacts(List<MemoryFact> facts){ memoryFacts.clear(); memoryFacts.addAll(facts); }
+
+    // ── Scratchpad accessors ──────────────────────────────────────────────────────
+
+    public String getScratchpadNote()            { return scratchpadNote; }
+    public void   setScratchpadNote(String note) { scratchpadNote = note; notifyListeners(); }
+
+    // ── PhaseController ───────────────────────────────────────────────────────────
+
+    public PhaseController getPhaseController() {
+        if (phaseController == null) {
+            synchronized (this) {
+                if (phaseController == null) phaseController = new PhaseController(this);
+            }
+        }
+        return phaseController;
+    }
+
     // ── Context management ────────────────────────────────────────────────────────
 
     /** Removes all AI-pinned entries at once. */
@@ -300,7 +411,10 @@ public class ContextManager implements PersistentStateComponent<ContextManager.S
                 .filter(e -> e.source == Source.AI)
                 .toList();
         if (aiEntries.isEmpty()) return "No AI-pinned files to clear.";
-        aiEntries.forEach(this::removeEntry);
+        aiEntries.forEach(e -> {
+            getPhaseController().notifyEvicted(e.relativePath);
+            removeEntry(e);
+        });
         return "Cleared " + aiEntries.size() + " pinned file(s) from dynamic context.";
     }
 

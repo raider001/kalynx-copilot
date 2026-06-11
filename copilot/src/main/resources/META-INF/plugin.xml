@@ -70,6 +70,14 @@
         <agentTool implementation="copilot.agent.tools.RemoveFromContextTool"/>
         <agentTool implementation="copilot.agent.tools.ListContextTool"/>
         <agentTool implementation="copilot.agent.tools.ClearContextTool"/>
+        <!-- Phase workflow + memory -->
+        <agentTool implementation="copilot.agent.tools.CompletePhaseTool"/>
+        <agentTool implementation="copilot.agent.tools.RememberTool"/>
+        <!-- Stuck-loop escape + scratchpad -->
+        <agentTool implementation="copilot.agent.tools.AskUserTool"/>
+        <agentTool implementation="copilot.agent.tools.UpdateScratchpadTool"/>
+        <!-- Task completion -->
+        <agentTool implementation="copilot.agent.tools.FinishTaskTool"/>
     </extensions>
 
     <actions>

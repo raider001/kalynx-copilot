@@ -81,18 +81,20 @@ public class CompileProjectTool implements AgentTool {
             return "Error: Compilation was aborted.";
         }
 
+        String result;
         if (errors.isEmpty()) {
-            return "BUILD SUCCESSFUL" +
-                    (warnings.isEmpty() ? "" : "\n" + warnings.size() + " warning(s) — run again with details if needed.");
+            result = "BUILD SUCCESSFUL"
+                   + (warnings.isEmpty() ? "" : "\n" + warnings.size() + " warning(s) — run again with details if needed.");
+        } else {
+            StringBuilder sb = new StringBuilder();
+            sb.append("BUILD FAILED\n\nERRORS (").append(errors.size()).append("):\n");
+            errors.forEach(e -> sb.append("  ").append(e).append('\n'));
+            if (!warnings.isEmpty()) sb.append("\nWARNINGS: ").append(warnings.size()).append(" (suppressed)");
+            result = sb.toString().stripTrailing();
         }
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("BUILD FAILED\n\nERRORS (").append(errors.size()).append("):\n");
-        errors.forEach(e -> sb.append("  ").append(e).append('\n'));
-        if (!warnings.isEmpty()) {
-            sb.append("\nWARNINGS: ").append(warnings.size()).append(" (suppressed)");
-        }
-        return sb.toString().stripTrailing();
+        copilot.context.ContextManager.getInstance(project).getPhaseController()
+                .notifyVerifyResult(errors.isEmpty(), errors.size(), result);
+        return result;
     }
 
     private static String formatMessage(CompilerMessage m) {

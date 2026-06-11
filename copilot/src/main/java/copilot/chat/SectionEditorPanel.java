@@ -48,7 +48,12 @@ public class SectionEditorPanel extends JPanel {
     private final JPanel             cardPanel;  // null when !useMarkdownToggle
     private final Supplier<String>   getter;
     private final Consumer<String>   setter;
+    private final JLabel             tokenLabel;
     private boolean                  suppressListener = false;
+
+    private static final Color TOKEN_OK   = new Color(0x88, 0x88, 0x88); // same as MUTED
+    private static final Color TOKEN_WARN = new Color(0xFF, 0xCC, 0x00);
+    private static final Color TOKEN_HIGH = new Color(0xFF, 0x6B, 0x6B);
 
     public SectionEditorPanel(CopilotChatPanel chatPanel,
                               String title,
@@ -75,6 +80,10 @@ public class SectionEditorPanel extends JPanel {
         descLabel.setForeground(MUTED);
         descLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
 
+        tokenLabel = new JLabel("~0 tokens");
+        tokenLabel.setForeground(TOKEN_OK);
+        tokenLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+
         JButton resetBtn = new JButton("Reset");
         resetBtn.setToolTipText("Reset to default");
         resetBtn.addActionListener(e -> reset());
@@ -84,8 +93,13 @@ public class SectionEditorPanel extends JPanel {
         titleRow.add(titleLabel, BorderLayout.WEST);
         titleRow.add(resetBtn, BorderLayout.EAST);
 
+        JPanel descRow = new JPanel(new BorderLayout());
+        descRow.setOpaque(false);
+        descRow.add(descLabel, BorderLayout.WEST);
+        descRow.add(tokenLabel, BorderLayout.EAST);
+
         header.add(titleRow, BorderLayout.NORTH);
-        header.add(descLabel, BorderLayout.SOUTH);
+        header.add(descRow, BorderLayout.SOUTH);
 
         // --- Text area (always created) ---
         textArea = new JTextArea();
@@ -173,6 +187,14 @@ public class SectionEditorPanel extends JPanel {
 
     private void onChange() {
         if (!suppressListener) setter.accept(textArea.getText());
+        updateTokenCount();
+    }
+
+    private void updateTokenCount() {
+        String text = textArea.getText();
+        int estimate = text == null || text.isBlank() ? 0 : Math.round(text.length() / 4.0f);
+        tokenLabel.setText("~" + estimate + " tokens");
+        tokenLabel.setForeground(estimate > 600 ? TOKEN_HIGH : estimate > 300 ? TOKEN_WARN : TOKEN_OK);
     }
 
     private void loadFromSession() {
@@ -184,6 +206,7 @@ public class SectionEditorPanel extends JPanel {
             showCard("VIEW");
         }
         suppressListener = false;
+        updateTokenCount();
     }
 
     void reset() {}

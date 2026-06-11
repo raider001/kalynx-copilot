@@ -94,6 +94,7 @@ public class CreateFileTool implements AgentTool {
                 ChangeReviewManager.getInstance(project).addChange(change);
 
                 result[0] = "Created and added to Review panel: " + relativePath;
+                copilot.context.ContextManager.getInstance(project).getPhaseController().notifyEdit(relativePath);
             } catch (Exception e) {
                 result[0] = "Error creating file: " + e.getMessage();
             }

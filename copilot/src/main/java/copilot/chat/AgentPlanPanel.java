@@ -39,9 +39,14 @@ public class AgentPlanPanel extends JPanel {
         MD_RENDERER = HtmlRenderer.builder().extensions(exts).build();
     }
 
+    private static final Color TOKEN_OK   = new Color(0x88, 0x88, 0x88);
+    private static final Color TOKEN_WARN = new Color(0xFF, 0xCC, 0x00);
+    private static final Color TOKEN_HIGH = new Color(0xFF, 0x6B, 0x6B);
+
     private final Project     project;
     private final JEditorPane planPane;
     private final JScrollPane scroll;
+    private final JLabel      tokenLabel;
 
     public AgentPlanPanel(Project project, CopilotChatPanel chatPanel) {
         this.project = project;
@@ -62,6 +67,10 @@ public class AgentPlanPanel extends JPanel {
         descLabel.setForeground(MUTED);
         descLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
 
+        tokenLabel = new JLabel("~0 tokens");
+        tokenLabel.setForeground(TOKEN_OK);
+        tokenLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+
         JButton clearBtn = new JButton("Clear plan");
         clearBtn.addActionListener(e -> ContextManager.getInstance(project).clearCurrentPlan());
 
@@ -70,8 +79,13 @@ public class AgentPlanPanel extends JPanel {
         titleRow.add(titleLabel, BorderLayout.WEST);
         titleRow.add(clearBtn, BorderLayout.EAST);
 
+        JPanel descRow = new JPanel(new BorderLayout());
+        descRow.setOpaque(false);
+        descRow.add(descLabel, BorderLayout.WEST);
+        descRow.add(tokenLabel, BorderLayout.EAST);
+
         header.add(titleRow, BorderLayout.NORTH);
-        header.add(descLabel, BorderLayout.SOUTH);
+        header.add(descRow, BorderLayout.SOUTH);
 
         // --- Markdown-rendered plan pane ---
         planPane = new JEditorPane();
@@ -106,6 +120,10 @@ public class AgentPlanPanel extends JPanel {
                     ? MD_RENDERER.render(MD_PARSER.parse(plan))
                     : "<p style='color:#888888;'><i>No active plan — the agent will create one "
                       + "using create_plan when starting a multi-step task.</i></p>";
+
+            int estimate = hasPlan ? Math.round(plan.length() / 4.0f) : 0;
+            tokenLabel.setText("~" + estimate + " tokens");
+            tokenLabel.setForeground(estimate > 600 ? TOKEN_HIGH : estimate > 300 ? TOKEN_WARN : TOKEN_OK);
 
             // Preserve scroll position across live updates; only reset to top when
             // the plan is newly created (previously there was no content).

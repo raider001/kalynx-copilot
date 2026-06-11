@@ -5,6 +5,8 @@ import com.intellij.openapi.project.Project;
 import copilot.CopilotSettings;
 import copilot.CopilotUtil;
 import copilot.context.ContextManager;
+import copilot.agent.Phase;
+import copilot.agent.PhaseController;
 import copilot.chat.ChatMessage;
 import copilot.chat.ConversationHistory;
 import copilot.tools.api.AgentTool;
@@ -42,7 +44,7 @@ public class AgentSession {
 
     /** Tools that mutate state — calling one resets the duplicate-call detector. */
     private static final Set<String> WRITE_TOOLS =
-            Set.of("replace_in_file", "create_file", "create_plan", "update_plan");
+            Set.of("replace_in_file", "create_file", "create_plan", "update_plan", "complete_phase");
     private final Project project;
     private       String  baseSysPmt;
     private       String  modePrompt = "";
@@ -64,6 +66,15 @@ public class AgentSession {
     private int currentCompressionThreshold = 0;
     private boolean compressionInitialized  = false;
 
+    /** Budget tracking for the manifest header (#5). */
+    private int currentIterations = 0;
+    private int currentTokens     = 0;
+
+    /** Stable-prefix cache for prompt caching (#6). Invalidated on phase change or section edit. */
+    private String cachedStablePrefix = null;
+    private Phase  cachedPhase        = null;
+    private String cachedModePrompt   = null;
+
     /**
      * Cancels the current request. Disconnects the in-flight HTTP connection so the
      * background thread unblocks as quickly as possible.
@@ -79,6 +90,7 @@ public class AgentSession {
     /** Updates the mode prompt prefix — applied from the next {@link #chat} call onward. */
     public void setModePrompt(String prompt) {
         this.modePrompt = prompt == null ? "" : prompt;
+        cachedPhase = null; // invalidate stable prefix cache
     }
 
     public AgentSession(Project project) {
@@ -112,6 +124,7 @@ public class AgentSession {
             sectionGuidelines      = guidelines      != null ? guidelines      : defaultGuidelinesSection();
             baseSysPmt = assembleSystemPrompt();
         }
+        cachedPhase = null; // invalidate stable prefix cache
         history.setSystemMessage(baseSysPmt);
     }
 
@@ -129,18 +142,21 @@ public class AgentSession {
     public void setDynamicContextSection(String text) {
         if (sectionDynamicContext == null) return; // custom prompt active — ignore
         sectionDynamicContext = text;
+        cachedPhase = null;
         baseSysPmt = assembleSystemPrompt();
     }
 
     public void setAgenticWorkflowSection(String text) {
         if (sectionAgenticWorkflow == null) return;
         sectionAgenticWorkflow = text;
+        cachedPhase = null;
         baseSysPmt = assembleSystemPrompt();
     }
 
     public void setGuidelinesSection(String text) {
         if (sectionGuidelines == null) return;
         sectionGuidelines = text;
+        cachedPhase = null;
         baseSysPmt = assembleSystemPrompt();
     }
 
@@ -179,7 +195,11 @@ public class AgentSession {
                         new copilot.agent.tools.GetIDEProblemsTool(),
                         new copilot.agent.tools.ScanProblemsTool(),
                         new copilot.agent.tools.RunTestsTool(),
-                        new copilot.agent.tools.FinishTaskTool()
+                        new copilot.agent.tools.FinishTaskTool(),
+                        new copilot.agent.tools.CompletePhaseTool(),
+                        new copilot.agent.tools.RememberTool(),
+                        new copilot.agent.tools.AskUserTool(),
+                        new copilot.agent.tools.UpdateScratchpadTool()
                 ));
             }
             for (AgentTool t : tools) toolMap.put(t.getName(), t);
@@ -187,22 +207,12 @@ public class AgentSession {
 
         // Refresh system message so mode, context-file changes, etc. are picked up each turn
         ContextManager cm = ContextManager.getInstance(project);
-        String contextBlock = cm.buildContextBlock();
-        String effectiveSysPmt = modePrompt.isBlank()
-                ? baseSysPmt
-                : modePrompt + "\n\n" + baseSysPmt;
+        PhaseController pc = cm.getPhaseController();
 
-        String plan = cm.getCurrentPlan();
-        String planBlock = (plan != null && !plan.isBlank())
-                ? "\n\n# Active Resolution Plan\nYou are in the RESOLVE phase. " +
-                  "Work through each milestone in order. " +
-                  "Use update_plan to advance milestone status and tick exit-criteria checkboxes.\n\n" + plan
-                : "";
+        // Auto-reset to ANALYSE when the previous task completed
+        if (pc.getPhase() == Phase.DONE) pc.resetForNewTask();
 
-        String fullSysPmt = effectiveSysPmt + planBlock;
-        history.setSystemMessage(contextBlock.isBlank()
-                ? fullSysPmt
-                : fullSysPmt + "\n\n" + contextBlock);
+        history.setSystemMessage(buildFullSystemMessage(cm, pc));
 
         history.add(ChatMessage.user(userMessage));
 
@@ -232,10 +242,14 @@ public class AgentSession {
         // A repeat signature means the model is looping without making progress.
         Set<String> callsSinceLastWrite = new LinkedHashSet<>();
 
+        // Tracks the signature of the last write tool call to detect consecutive identical writes.
+        String lastWriteSig = null;
+
         int iterations = 0;
         while (iterations < maxIterations) {
             if (cancelled) return "⏹ Request cancelled.";
             iterations++;
+            currentIterations = iterations;
 
             // Cap max_tokens so prompt + output never exceeds the context window.
             // Use the agent's configured maxOutputTokens as the ceiling; shrink only
@@ -297,6 +311,7 @@ public class AgentSession {
                 int promptTokens     = usage.has("prompt_tokens")     ? usage.get("prompt_tokens").getAsInt()     : 0;
                 int completionTokens = usage.has("completion_tokens") ? usage.get("completion_tokens").getAsInt() : 0;
                 lastPromptTokens = promptTokens; // track for next iteration's max_tokens calculation
+                currentTokens    = promptTokens;
                 callback.onUsage(promptTokens, completionTokens, resolvedCtxWindow);
             }
 
@@ -357,15 +372,20 @@ public class AgentSession {
                     callback.onToolStart(toolName, description);
 
                     // --- Stuck-loop detection ---
-                    // Write tools reset the tracker; read-only tools are checked for duplicates.
+                    // Write tools reset the read-tracker; consecutive identical writes are caught via lastWriteSig.
                     String toolResult;
                     boolean success = true;
                     boolean isDuplicate = false;
 
+                    String sig = toolName + " " + argsStr;
                     if (WRITE_TOOLS.contains(toolName)) {
-                        callsSinceLastWrite.clear();
+                        if (sig.equals(lastWriteSig)) {
+                            isDuplicate = true; // same write called twice in a row
+                        } else {
+                            lastWriteSig = sig;
+                            callsSinceLastWrite.clear();
+                        }
                     } else {
-                        String sig = toolName + " " + argsStr;
                         if (callsSinceLastWrite.contains(sig)) {
                             isDuplicate = true;
                         } else {
@@ -374,15 +394,22 @@ public class AgentSession {
                     }
 
                     if (isDuplicate) {
+                        boolean isWrite = WRITE_TOOLS.contains(toolName);
                         toolResult = "LOOP DETECTED: '" + toolName + "' was already called with these " +
-                                     "exact arguments since your last code change — the result will be " +
-                                     "identical to what you already received. Do not call it again.\n" +
-                                     "You must make a code change before calling this tool again.\n" +
-                                     "Required next action:\n" +
-                                     "  • Identify the specific error from the output you already received.\n" +
-                                     "  • Use replace_in_file to fix it, then re-run.\n" +
-                                     "  • If you cannot determine how to fix it, stop and explain the problem to the user.\n" +
-                                     "Do NOT call finish_task — a loop means the problem is not resolved.";
+                                     "exact arguments " + (isWrite ? "(your edit was already applied)" : "since your last code change") + " " +
+                                     " — the result will be identical.\n" +
+                                     (isWrite
+                                       ? "The compile error is on DIFFERENT lines.\n" +
+                                         "Required next action:\n" +
+                                         "  " + (char)0x2022 + " Call read_file to get the current file content.\n" +
+                                         "  " + (char)0x2022 + " Identify which lines still cause the compile error.\n" +
+                                         "  " + (char)0x2022 + " Fix THOSE lines " + (char)0x2014 + " do not repeat this edit.\n" +
+                                         "  " + (char)0x2022 + " If you cannot see a new approach, call ask_user."
+                                       : "You must make a code change before calling this tool again.\n" +
+                                         "Required next action:\n" +
+                                         "  " + (char)0x2022 + " Identify the specific error from the output you already received.\n" +
+                                         "  " + (char)0x2022 + " Use replace_in_file to fix it, then re-run.\n" +
+                                         "  " + (char)0x2022 + " If you cannot determine how to fix it, call ask_user.");
                         success = false;
                     } else {
                         try {
@@ -404,6 +431,17 @@ public class AgentSession {
                                         history.pruneToolMessages();
                                     maybeCompress(lastPromptTokens, callback);
                                     return summary;
+                                }
+
+                                // --- Ask user signal ---
+                                if (toolResult != null && toolResult.startsWith(
+                                        copilot.agent.tools.AskUserTool.ASK_SIGNAL)) {
+                                    String question = toolResult.substring(
+                                            copilot.agent.tools.AskUserTool.ASK_SIGNAL.length()).trim();
+                                    history.add(ChatMessage.toolResult(callId, toolName, "Question posed to user."));
+                                    callback.onToolEnd(toolName, true);
+                                    maybeCompress(lastPromptTokens, callback);
+                                    return question;
                                 }
 
                                 if (toolResult != null && toolResult.startsWith("Error:")) {
@@ -438,18 +476,7 @@ public class AgentSession {
 
                 // Refresh system message so the model sees the latest pinned file content
                 // (edits made this round are now reflected in the live file reads).
-                String refreshedContext = cm.buildContextBlock();
-                String refreshedSysPmt = modePrompt.isBlank() ? baseSysPmt : modePrompt + "\n\n" + baseSysPmt;
-                String refreshedPlan = cm.getCurrentPlan();
-                String refreshedPlanBlock = (refreshedPlan != null && !refreshedPlan.isBlank())
-                        ? "\n\n# Active Resolution Plan\nYou are in the RESOLVE phase. " +
-                          "Work through each step below in order. " +
-                          "Pin only the file for the current step before editing.\n\n" + refreshedPlan
-                        : "";
-                String refreshedFull = refreshedSysPmt + refreshedPlanBlock;
-                history.setSystemMessage(refreshedContext.isBlank()
-                        ? refreshedFull
-                        : refreshedFull + "\n\n" + refreshedContext);
+                history.setSystemMessage(buildFullSystemMessage(cm, pc));
 
                 // continue loop to feed tool results back to the model
 
@@ -499,6 +526,7 @@ public class AgentSession {
         callback.onCompressionStarted();
 
         String snapshotPath = saveSnapshot();
+        extractFactsBeforeCompression(); // save durable knowledge before crushing turns
         history.pruneOldToolPairs(20);
 
         List<ChatMessage> compressed = callCompressionLlm();
@@ -775,170 +803,398 @@ public class AgentSession {
     // System-prompt sections  (public so UI can read the defaults)
     // ------------------------------------------------------------------
 
-    /** Intro + tool list — never user-editable. */
+    /** Intro + hard rules + tool list — never user-editable. */
     public static String staticPromptSection() {
         return """
                 You are Kalynx Copilot, an expert AI coding assistant embedded in IntelliJ IDEA.
-                You help developers write, understand, refactor, debug, and build code.
+                Use the tools below to read files, modify code, search the project, and run builds.
 
-                You have access to tools that let you read and modify files, search the project,
-                and run build commands. Use them proactively to gather context before answering.
+                ## Hard rules — never violate
+                1. Before ANY tool call, output: `[PHASE] Target: <what>. Expect: <outcome>.`
+                2. Never call compile_project without first making a code change this iteration.
+                3. Never call finish_task unless the last compile/test output confirms success.
+                4. If stuck with no new ideas: stop and ask the user — do not loop.
 
-                Available tools:
-                - get_current_file    — get the file currently open in the editor (auto-pins it)
-                - list_files          — list the project directory tree
-                - add_to_context      — pin a file or folder; its content appears in the
-                                        ## section of THIS system message next turn —
-                                        not in the tool result. Re-read from disk every turn.
-                - remove_from_context — unpin a specific file or folder when no longer needed
-                - list_context        — list exact paths of all currently pinned files
-                                        (use before remove_from_context if unsure of the path)
-                - clear_context       — unpin ALL AI-pinned files at once (for task switching)
-                - replace_in_file     — apply a targeted find-and-replace edit to a file.
-                - create_file         — create a new file with given content
-                - create_plan         — transition from Analyse to Resolve: stores your
-                                        structured Markdown resolution plan (visible every turn)
-                                        and clears all pinned files. Call this once you understand
-                                        the problem and are ready to start making changes.
-                - update_plan         — update the active plan in place: advance a milestone
-                                        status (NOT STARTED → IN PROGRESS → COMPLETE) or tick
-                                        an exit-criteria checkbox (- [ ] → - [x]).
-                                        Does NOT clear pinned files.
-                - search_in_files     — search across all project files by regex or substring
-                - scan_problems        — run IntelliJ's inspection engine across all source files
-                                        (or a subdirectory) and return errors and warnings;
-                                        works without opening files in the editor
-                - get_problems         — quick read of live errors/warnings for files already
-                                        open in the editor (faster but limited to open files)
-                - compile_project      — compile the project using IntelliJ's built-in compiler;
-                                        returns errors with exact file paths and line numbers;
-                                        always available, no Gradle/Maven wrapper required
-                - maven_build         — run Maven goals (test, package, install, etc.)
-                                        only available if a pom.xml exists in the project root
-                - gradle_build         — run Gradle tasks (test, build, etc.)
-                                        only available if a build.gradle / build.gradle.kts exists
-                - run_tests            — run unit tests using Maven or Gradle (auto-detected);
-                                        accepts an optional 'filter' for a specific class or method:
-                                        "MyClass", "MyClass#myMethod", or "com.example.*";
-                                        returns a per-test pass/fail breakdown with stack traces
-                - finish_task          — signal that the task is fully complete and end the loop.
-                                        Call this ONLY when all milestones are COMPLETE, all tests
-                                        pass, and there is nothing left to do. Provide a summary.
-                                        Do NOT call it while there are still failures or open work.""";
+                ## Known failure modes
+                | Name | Trigger | Required response |
+                |---|---|---|
+                | LOOP | Same tool + args called twice | Output `[LOOP DETECTED]` — re-state request, re-diagnose |
+                | DRIFT | Lost track of original request | Re-read your anchor sentence from ANALYSE |
+                | BLIND_COMPILE | compile_project with no prior change | Forbidden |
+                | STALE_READ | Used history snapshot instead of ## section | Read ## sections only — never history |
+                | PREMATURE_FINISH | finish_task before tests confirm success | Forbidden |
+
+                ## Tools
+                - get_current_file    — active editor file (auto-pins it)
+                - list_files          — project directory tree
+                - add_to_context      — pin file/folder; content appears in ## sections next turn
+                - remove_from_context — unpin a path (call list_context first if path is uncertain)
+                - list_context        — list all currently pinned paths
+                - clear_context       — unpin everything (use when switching tasks)
+                - replace_in_file     — targeted find-and-replace; auto-pins the file after each call
+                - create_file         — create a new file with content
+                - create_plan         — store a resolution plan and clear all pins
+                - update_plan         — advance milestone status or tick exit-criteria checkboxes
+                - search_in_files     — regex/substring search across all project files
+                - scan_problems       — IntelliJ inspections across source files; returns file:line errors
+                - get_problems        — live errors/warnings for open files only (faster, limited scope)
+                - compile_project     — compile; returns errors with exact file:line references
+                - run_tests           — run tests (Maven/Gradle auto-detected); accepts class/method filter
+                - complete_phase      — signal phase completion; plugin validates and transitions state
+                - remember            — store a durable fact in project memory (recalled in future sessions)
+                - ask_user            — stop and ask the user a structured question (required when stuck ≥3 verifies)
+                - update_scratchpad   — write a persistent note to yourself (max 500 chars, survives compression)
+                - finish_task         — end the agent loop (requires: milestones COMPLETE + test evidence)""";
     }
 
     public static String defaultDynamicContextSection() {
         return """
-                Dynamic context management:
-                - add_to_context (or equivalently read_file) pins a file. Its content does NOT
-                  appear in the tool result — it appears in the ## sections of THIS system message
-                  on the next turn, re-read live from disk. It is always current; never stale.
-                - If a file is already shown in the ## sections above, you have its current
-                  content — do not pin it again. Conversation history may contain old snapshots;
-                  always prefer the ## section content over anything seen in prior turns.
-                - Use remove_from_context to unpin individual files when you are done with them.
-                  If unsure of the exact path, call list_context first to get the precise string.
-                - Use clear_context when switching to a completely new task so stale context
-                  does not bleed into the next request.
-                - When multiple files share the same filename, use the full relative path
-                  (e.g. src/foo/Server.java vs src/bar/Server.java) to identify which file
-                  to edit. Never construct old_code from one file's section and apply it to
-                  a different file's path.
-                - Never construct old_code from memory or prior turns. It must come from the
-                  content visible right now under the specific ## section you are targeting.""";
+                ## Context rules
+                - Pinned file content appears in the `##` sections of THIS system message — not in tool results.
+                - `##` content is re-read from disk every turn and is always current. History snapshots are stale — never use them.
+                - Never construct `old_code` from memory or prior turns — copy exact text from the relevant `##` section only.
+                - Same filename in multiple directories: always use the full relative path to disambiguate.
+                - `remove_from_context`: call `list_context` first if the exact path is uncertain.
+                - `clear_context`: use when switching to a new task so stale context does not carry over.""";
     }
 
     public static String defaultAgenticWorkflowSection() {
         return """
-                Follow these phases for any multi-file task.
+                ## Workflow
 
-                ### 1. ANALYSE
-                Pin and read the files you need to understand the problem. Read broadly — you may pin multiple files during this phase.
+                **Anchor** — At the start of ANALYSE, output one sentence: "The user wants me to [restate request]." Return to it if you feel lost.
+                Declare your phase at the start of each response: `Phase: RESOLVE / Milestone 2`
 
-                ### 2. PLAN
-                Once you understand the problem, call `create_plan` with a structured Markdown plan:
-                - `# Technical Spike: ...` title
-                - `**Objective:**` summary and `**Progress:** 0 / N milestones complete`
-                - Each milestone as `## Milestone N: title` with **Status**, **Objective**, **Relevant files**, **Context**, and **Exit criteria** checkboxes (`- [ ] items`)
-                - `---` horizontal rule between milestones
+                ### ANALYSE
+                Pin and read files broadly to understand the problem. Do not make code changes yet.
 
-                This clears all pinned files and locks in the plan. **Do not skip this step.**
+                ### PLAN
+                Call `create_plan` once you understand the problem. Structure:
+                - `# Technical Spike: ...` title; `**Objective:**`; `**Progress:** 0/N milestones`
+                - Each milestone: `## Milestone N: title`, **Status**, **Objective**, **Relevant files**, **Exit criteria** (`- [ ]` checkboxes)
+                - `---` between milestones
 
-                ### 3. RESOLVE
-                Work through each milestone in order:
+                ### RESOLVE
+                For each milestone in order:
+                1. `update_plan` → IN PROGRESS
+                2. Pin milestone files (`add_to_context`)
+                3. Inner loop (below) for each change
+                4. Tick all exit criteria → `update_plan` → COMPLETE → unpin files
 
-                1. Call `update_plan` to set the milestone to **IN PROGRESS**
-                2. Pin only the files listed for that milestone (`add_to_context`)
-                3. For each individual change, follow the **inner loop** below
-                4. Once all exit-criteria checkboxes are ticked, set milestone to **COMPLETE**
-                5. Unpin milestone files, then move to the next milestone
-
-                ---
-
-                **Inner loop — repeat for each change within a milestone**
-
-                **SETUP** — Read the exact section you are about to modify. Confirm the current state — never act on assumptions.
-
-                **DETERMINE** — State the root cause this change addresses. What will you change, in which file, and why? If you cannot state the root cause clearly, read more context first.
-
-                **ACT** — Make exactly one targeted change (`replace_in_file` or `create_file`).
-
-                **TEST** — Compile or run the relevant test. Read the full output.
-
-                **REASON** — Evaluate holistically before deciding what to do next:
-                - Did this change fix the stated root cause?
-                - Does it satisfy the relevant exit criterion, or is more work needed?
-                - Could it have introduced a regression elsewhere? If yes, add an inner-loop iteration to verify.
-                - Does it still align with the milestone objective and overall plan? If not, `update_plan` before continuing.
-                - What is the single most important next action?
-
-                > **If the test FAILED:** do not immediately make another change. Re-read the output and code, revise your root-cause diagnosis. **Never go TEST → ACT without passing through REASON.**
+                ### FINISH
+                All milestones COMPLETE and tests pass → call `finish_task`.
 
                 ---
 
-                ### 4. TEST
-                Run `compile_project` after all milestones are COMPLETE. Apply the same inner loop to each fix.
+                ## Inner loop: SETUP → DETERMINE → ACT → TEST → REASON
 
-                - Never call a build tool again without first making a code change — recompiling without changes always produces the same result.
-                - If you cannot determine how to fix an error, **stop and ask the user**.
+                **SETUP** — Output `[SETUP] Target: <exact thing to read>. Expect: <what you expect to see>.`
+                Read the section you are about to modify. Never act on assumptions.
 
-                ### 5. FINISH
-                When all milestones are COMPLETE and all tests pass, call `finish_task` with a summary of what was done.
-                Do NOT call `finish_task` before tests pass. Do NOT keep calling tools after the task is done.""";
+                **DETERMINE** — Output `[DETERMINE] Root cause: <X>. Change: <what> in <file> because <why>.`
+                If you cannot fill every field specifically, read more context first.
+
+                **ACT** — Output `[ACT] Applying: <one-line description>.`
+                Make exactly one change: `replace_in_file` or `create_file`.
+
+                **TEST** — Output `[TEST] Verifying: <what this should confirm>.`
+                Compile or run the relevant test. Read the full output.
+
+                **REASON** — Answer all before proceeding:
+                - Root cause addressed? [yes/no — why]
+                - Exit criterion met? [yes/no — which / what remains]
+                - Regression possible? [yes/no — where]
+                ▶ **NEXT:** [SETUP | DETERMINE | ACT | TEST | MILESTONE COMPLETE | finish_task | ASK USER] — because [one sentence].
+
+                > If the test FAILED: complete REASON before making another change. Never go TEST → ACT directly.""";
     }
 
     public static String defaultGuidelinesSection() {
         return """
-                Guidelines:
-                - Be concise and precise. Favour working code over lengthy explanations.
-                - When suggesting code changes, use replace_in_file or create_file to apply them directly.
-                - Documentation, design documents, architecture notes, and any other non-source
-                  files must be placed under Documentation/ at the project root (e.g.
-                  Documentation/design/MyFeature.md). Never write docs or notes into a
-                  source directory (src/, java/, resources/, etc.).
-                - Always pin the relevant file(s) via add_to_context before suggesting changes.
-                - When you create or edit a file, confirm what you did in your final response.
-                - Never invent file contents — always pin and read first.
-                - After EVERY replace_in_file call (success or failure), the file is
-                  automatically pinned. Before doing anything else, read its current content
-                  from the dynamic context above to confirm the actual state of the file.
-                - If replace_in_file succeeds: verify the new_code is present in the pinned
-                  content. If it is already there from a previous edit, do not apply it again.
-                - If replace_in_file fails (old_code not found): read the pinned content,
-                  find the exact text as it appears now, and retry once with the correct
-                  old_code. Never guess or vary the text — that causes infinite loops.
-                - After making ANY code changes (replace_in_file or create_file), you MUST
-                  immediately run compile_project to verify the code compiles. Do NOT report
-                  success before the build passes. Use gradle_build or maven_build only when
-                  you need to run tests or produce build artefacts.
-                - When compilation fails: each error tells you the exact file and line.
-                  Pin that file, read it, make a targeted fix, then recompile.
-                  Only call compile_project after you have changed something — recompiling
-                  with no changes made will always produce the same errors.
-                - If you cannot determine how to fix a build error (e.g. missing dependency,
-                  unknown symbol, configuration issue), stop immediately and tell the user:
-                  show them the exact error, explain what you tried, and ask for guidance.
-                  Do not guess, do not retry the same build, do not loop.""";
+                ## Guidelines
+                - Non-source files (docs, notes, design) → `Documentation/` at the project root. Never write them into `src/`, `java/`, or `resources/`.
+                - `replace_in_file` failure (old_code not found): read the `##` section for that file, copy exact current text, retry once. Never guess — wrong `old_code` causes infinite loops.
+                - After every `replace_in_file` (success or failure), the file is auto-pinned. Check the `##` section to verify the change before any further action.""";
+    }
+
+    // ------------------------------------------------------------------
+    // Phase workflow blocks  (one per phase, pushed each turn)
+    // ------------------------------------------------------------------
+
+    private static String buildPhaseWorkflowBlock(Phase phase) {
+        return switch (phase) {
+            case ANALYSE  -> phaseBlockAnalyse();
+            case PLAN     -> phaseBlockPlan();
+            case IMPLEMENT -> phaseBlockImplement();
+            case VERIFY   -> phaseBlockVerify();
+            case DONE     -> phaseBlockDone();
+        };
+    }
+
+    private static String phaseBlockAnalyse() {
+        return """
+                ## Phase: ANALYSE
+
+                Your first task is to understand the problem.
+
+                **Anchor:** Output one sentence before any tool call: "The user wants me to [restate request]."
+
+                Explore using add_to_context, search_in_files, get_current_file, list_files.
+                Do not make any code changes yet.
+
+                When you understand the problem: call `complete_phase(current_phase="ANALYSE")`.
+                The system message will update to PLAN phase instructions on the next turn.""";
+    }
+
+    private static String phaseBlockPlan() {
+        return """
+                ## Phase: PLAN
+
+                You understand the problem. Create a resolution plan with `create_plan`.
+
+                Required structure:
+                - `# Technical Spike: [short title]`
+                - `**Objective:**` one or two sentences
+                - `**Progress:** 0/N milestones complete`
+                - Each milestone: `## Milestone N: title`, **Status** (NOT STARTED), **Objective**,
+                  **Relevant files**, **Exit criteria** (`- [ ]` checkboxes)
+
+                When done: call `complete_phase(current_phase="PLAN")`.""";
+    }
+
+    private static String phaseBlockImplement() {
+        return """
+                ## Phase: IMPLEMENT
+
+                Work through milestones. Use the inner loop for every change:
+
+                **SETUP** — `[SETUP] Target: <exact thing to read>. Expect: <what you expect>.`
+                Read the section you are about to modify. Never act on assumptions.
+
+                **DETERMINE** — `[DETERMINE] Root cause: <X>. Change: <what> in <file> because <why>.`
+                If you cannot fill every field specifically, read more first.
+
+                **ACT** — `[ACT] Applying: <one-line description>.`
+                Make exactly one change: `replace_in_file` or `create_file`.
+
+                **TEST** — Compile or run the relevant test immediately.
+
+                **REASON** — Answer all before proceeding:
+                - Root cause addressed? [yes/no — why]
+                - Exit criterion met? [yes/no — which / what remains]
+                - Regression possible? [yes/no — where]
+                ▶ **NEXT:** [SETUP | DETERMINE | ACT | TEST | complete_phase | ASK USER]
+
+                When ready to verify: call `complete_phase(current_phase="IMPLEMENT")`.
+                If stuck / re-diagnosis needed: call `complete_phase(current_phase="IMPLEMENT", next_phase="ANALYSE")`.""";
+    }
+
+    private static String phaseBlockVerify() {
+        return """
+                ## Phase: VERIFY
+
+                Run `compile_project` or `run_tests` to verify your changes. Read the full output.
+
+                **If tests pass:**
+                - Update the plan: mark milestones COMPLETE, tick exit-criteria checkboxes
+                - More milestones remain → `complete_phase(current_phase="VERIFY", next_phase="IMPLEMENT")`
+                - All milestones complete → `complete_phase(current_phase="VERIFY", next_phase="DONE")`
+
+                **If tests fail:**
+                - Analyse failures before making any change
+                - `complete_phase(current_phase="VERIFY", next_phase="IMPLEMENT")` to return to fixing
+
+                The DONE gate is hard: a passing verify must have run after the last code change.
+                No testable output (docs-only, config change)? Provide `waive_reason`.""";
+    }
+
+    private static String phaseBlockDone() {
+        return """
+                ## Phase: DONE
+
+                All milestones complete and tests pass.
+                Call `finish_task` with a summary and the exact evidence line from the last verify output.""";
+    }
+
+    // ------------------------------------------------------------------
+    // System-message assembly  (called every turn)
+    // ------------------------------------------------------------------
+
+    /**
+     * Returns the stable, cacheable prefix of the system message (#6).
+     * Recomputed only when phase or sections change; byte-identical otherwise
+     * to enable prompt-cache hits in OpenAI-compatible APIs.
+     */
+    private String getStablePrefix(Phase phase) {
+        String effectiveMode = modePrompt != null ? modePrompt : "";
+        if (!phase.equals(cachedPhase)
+                || !effectiveMode.equals(cachedModePrompt != null ? cachedModePrompt : "")
+                || cachedStablePrefix == null) {
+            String basePrompt;
+            if (sectionDynamicContext == null) {
+                basePrompt = baseSysPmt;
+            } else {
+                basePrompt = staticPromptSection()
+                        + "\n\n" + sectionDynamicContext
+                        + "\n\n" + buildPhaseWorkflowBlock(phase)
+                        + "\n\n" + sectionGuidelines;
+            }
+            cachedStablePrefix = effectiveMode.isBlank() ? basePrompt : effectiveMode + "\n\n" + basePrompt;
+            cachedPhase        = phase;
+            cachedModePrompt   = effectiveMode;
+        }
+        return cachedStablePrefix;
+    }
+
+    /**
+     * Reads the IDE daemon's known highlights for the last-edited file (#2).
+     * Fast (reads cached analysis), safe to call from any thread via ReadAction.
+     * Returns empty string if no file has been edited or no errors are known yet.
+     */
+    private String buildInlineProblemsSection(PhaseController pc) {
+        String relPath = pc.getLastEditedRelPath();
+        if (relPath == null || relPath.isBlank()) return "";
+        String basePath = project.getBasePath();
+        if (basePath == null) return "";
+        try {
+            return com.intellij.openapi.application.ApplicationManager.getApplication()
+                    .runReadAction((com.intellij.openapi.util.Computable<String>) () -> {
+                String fullPath = (basePath + "/" + relPath).replace("\\", "/");
+                com.intellij.openapi.vfs.VirtualFile vf =
+                        com.intellij.openapi.vfs.LocalFileSystem.getInstance().findFileByPath(fullPath);
+                if (vf == null) return "";
+                com.intellij.openapi.editor.Document doc =
+                        com.intellij.openapi.fileEditor.FileDocumentManager.getInstance().getDocument(vf);
+                if (doc == null) return "";
+                java.util.List<com.intellij.codeInsight.daemon.impl.HighlightInfo> highlights =
+                        com.intellij.codeInsight.daemon.impl.DaemonCodeAnalyzerImpl.getHighlights(doc, null, project);
+                if (highlights == null || highlights.isEmpty()) return "";
+                java.util.List<String> errors   = new java.util.ArrayList<>();
+                java.util.List<String> warnings = new java.util.ArrayList<>();
+                for (com.intellij.codeInsight.daemon.impl.HighlightInfo info : highlights) {
+                    if (info.getSeverity().compareTo(
+                            com.intellij.lang.annotation.HighlightSeverity.WARNING) < 0) continue;
+                    String desc = info.getDescription();
+                    if (desc == null || desc.isBlank()) continue;
+                    int line = doc.getLineNumber(info.getStartOffset()) + 1;
+                    String entry = relPath + ":" + line + " — " + desc;
+                    if (info.getSeverity().compareTo(
+                            com.intellij.lang.annotation.HighlightSeverity.ERROR) >= 0) {
+                        errors.add("[ERROR] " + entry);
+                    } else {
+                        warnings.add("[WARN] " + entry);
+                    }
+                }
+                if (errors.isEmpty() && warnings.isEmpty()) return "";
+                StringBuilder sb = new StringBuilder("=== IDE: " + relPath + " ===\n");
+                errors.forEach(e   -> sb.append(e).append('\n'));
+                warnings.forEach(w -> sb.append(w).append('\n'));
+                sb.append("===");
+                return sb.toString();
+            });
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private String buildFullSystemMessage(ContextManager cm, PhaseController pc) {
+        // Manifest at top (primacy) — includes budget (#5)
+        String manifestHeader = pc.buildManifestHeader(project.getBasePath(), currentIterations, currentTokens);
+
+        // Stable prefix: byte-identical across turns when nothing changed (#6)
+        String effectiveBase = getStablePrefix(pc.getPhase());
+
+        // Model scratchpad — persistent working note (#7)
+        String scratchpad = cm.getScratchpadNote();
+        String scratchpadBlock = (scratchpad != null && !scratchpad.isBlank())
+                ? "\n\n# Model Scratchpad\n" + scratchpad : "";
+
+        // Active plan
+        String plan = cm.getCurrentPlan();
+        String planBlock = (plan != null && !plan.isBlank())
+                ? "\n\n# Active Resolution Plan\n"
+                  + "Work through each milestone in order. "
+                  + "Use update_plan to advance status and tick exit-criteria checkboxes.\n\n" + plan
+                : "";
+
+        // Recalled memory (before pinned files)
+        String memBlock = pc.getMemoryStore().buildMemoryBlock(cm.getAIPinnedPaths());
+        String memSuffix = memBlock.isBlank() ? "" : "\n\n" + memBlock;
+
+        // Pinned file context
+        String contextBlock = cm.buildContextBlock();
+
+        // Stuck nudge at bottom (recency) (#3)
+        String stuckNudge  = pc.buildStuckNudge();
+        String nudgeSuffix = stuckNudge.isBlank() ? "" : "\n\n" + stuckNudge;
+
+        // IDE inline validation for last edited file — bottom of context (#2)
+        String inlineProblems = buildInlineProblemsSection(pc);
+        String inlineSuffix   = inlineProblems.isBlank() ? "" : "\n\n" + inlineProblems;
+
+        String assembled = manifestHeader + "\n\n" + effectiveBase + scratchpadBlock + planBlock + memSuffix;
+        return contextBlock.isBlank()
+                ? assembled + nudgeSuffix + inlineSuffix
+                : assembled + "\n\n" + contextBlock + nudgeSuffix + inlineSuffix;
+    }
+
+    // ------------------------------------------------------------------
+    // Memory extraction before compression
+    // ------------------------------------------------------------------
+
+    private void extractFactsBeforeCompression() {
+        StringBuilder conv = new StringBuilder();
+        for (ChatMessage msg : history.snapshot()) {
+            ChatMessage.Role role = msg.getRole();
+            if (role == ChatMessage.Role.SYSTEM || role == ChatMessage.Role.TOOL) continue;
+            if (msg.hasToolCalls()) continue;
+            String c = msg.getContent();
+            if (c == null || c.isBlank()) continue;
+            conv.append("[").append(role.name().toLowerCase()).append("]\n")
+                .append(c).append("\n\n");
+        }
+        if (conv.length() < 300) return; // not enough content to extract from
+
+        String prompt =
+            "Extract durable facts from this conversation for long-term project memory.\n"
+          + "Include: architectural decisions, discovered constraints, API/library quirks, "
+          + "root causes of bugs, gotchas that would surprise a new developer.\n"
+          + "Exclude: step-by-step task details, standard boilerplate, already-resolved steps.\n"
+          + "Return ONLY a JSON array: "
+          + "[{\"text\":\"one specific sentence\",\"fileTags\":[\"path/To.java\"]}]\n"
+          + "Maximum 8 facts. Only include things worth knowing in a brand-new session. "
+          + "Raw JSON only — no markdown wrapper.\n\n"
+          + "Conversation:\n\n"
+          + conv.substring(0, Math.min(conv.length(), 8000));
+
+        try {
+            CopilotSettings s = CopilotSettings.getInstance();
+            String raw = sendCompressionRequest(s.getApiEndpoint(), s.getApiKey(),
+                    buildCompressionRequest(s.getModel(), prompt));
+            if (raw == null || raw.isBlank()) return;
+
+            String trimmed = raw.trim();
+            if (trimmed.startsWith("```")) {
+                trimmed = trimmed.replaceFirst("^```(?:json)?\\s*\\r?\\n?", "")
+                                 .replaceFirst("\\r?\\n?```\\s*$", "").trim();
+            }
+
+            JsonArray arr = JsonParser.parseString(trimmed).getAsJsonArray();
+            ContextManager cm  = ContextManager.getInstance(project);
+            copilot.memory.MemoryStore store = cm.getPhaseController().getMemoryStore();
+            String phase = cm.getCurrentPhase() != null ? cm.getCurrentPhase().name() : "ANALYSE";
+
+            for (JsonElement el : arr) {
+                JsonObject obj = el.getAsJsonObject();
+                String text = obj.has("text") ? obj.get("text").getAsString() : "";
+                java.util.List<String> tags = new java.util.ArrayList<>();
+                if (obj.has("fileTags") && obj.get("fileTags").isJsonArray()) {
+                    for (JsonElement tag : obj.getAsJsonArray("fileTags"))
+                        tags.add(tag.getAsString());
+                }
+                if (!text.isBlank()) store.addOrUpdate(text, tags, phase, "plugin:compression");
+            }
+        } catch (Exception ignored) {}
     }
 }
 

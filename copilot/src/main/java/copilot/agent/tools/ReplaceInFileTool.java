@@ -5,6 +5,7 @@ import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.command.WriteCommandAction;
 import com.intellij.openapi.editor.Document;
 import com.intellij.openapi.fileEditor.FileDocumentManager;
+import com.intellij.openapi.fileEditor.FileEditorManager;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.vfs.LocalFileSystem;
 import com.intellij.openapi.vfs.VirtualFile;
@@ -124,19 +125,28 @@ public class ReplaceInFileTool implements AgentTool {
                         return;
                     }
 
-                    // Pin the file so its current content appears in the context block.
+                    // Pin the file so its current content appears in the ## section.
                     ContextManager.getInstance(project).addEntryForAI(relativePath);
 
                     // Check pinned files first — catches cross-file confusion.
                     String crossFileHint = findInPinnedFiles(project, basePath, normOld, relativePath);
-                    // Fall back to a project-wide search if not found in pinned files.
-                    String fileHint = crossFileHint != null ? crossFileHint
-                            : findFilesContaining(basePath, normOld, relativePath);
-
-                    result[0] = "old_code not found in '" + relativePath + "'. "
-                            + (fileHint.isEmpty() ? "" : fileHint + " ")
-                            + "'" + relativePath + "' is in your context block — "
-                            + "review its current content there and re-evaluate before retrying.";
+                    if (crossFileHint != null) {
+                        result[0] = "EDIT REJECTED: " + crossFileHint;
+                        return;
+                    }
+                    // Project-wide scan for the anchor text.
+                    String fileHint = findFilesContaining(basePath, normOld, relativePath);
+                    if (!fileHint.isEmpty()) {
+                        result[0] = "EDIT REJECTED: anchor not in '" + relativePath + "'. " + fileHint
+                                  + "Next action: re-try with file_path set to the correct file from that list.";
+                        return;
+                    }
+                    // Not found anywhere — anchor has drifted since the file was last read.
+                    String filename = java.nio.file.Path.of(relativePath).getFileName().toString();
+                    result[0] = "EDIT REJECTED: anchor not found in '" + relativePath
+                              + "' — file content has changed. "
+                              + "Next action: re-read the ## " + filename + " section (just re-pinned), "
+                              + "copy the exact current text for old_code, and retry.";
                     return;
                 }
                 newContent = normOrig.substring(0, normIdx) + newCode
@@ -148,6 +158,8 @@ public class ReplaceInFileTool implements AgentTool {
                 doc.setText(finalContent);
                 FileDocumentManager.getInstance().saveDocument(doc);
             });
+            // Open in editor so the daemon tracks and analyses the edited file.
+            FileEditorManager.getInstance(project).openFile(vf, false);
 
             PendingChange change = new PendingChange(relativePath, fullPath,
                     originalContent, newContent, PendingChange.ChangeType.MODIFY);
@@ -164,6 +176,7 @@ public class ReplaceInFileTool implements AgentTool {
             result[0] = "Applied: " + relativePath + " (" + delta + ")\n\n"
                       + "--- replaced:\n" + truncate(oldCode, 30) + "\n\n"
                       + "+++ with:\n" + truncate(newCode, 30);
+            ContextManager.getInstance(project).getPhaseController().notifyEdit(relativePath);
         });
 
         return result[0];
@@ -182,8 +195,8 @@ public class ReplaceInFileTool implements AgentTool {
                 String content = Files.readString(Path.of(basePath, pinned), StandardCharsets.UTF_8)
                                       .replace("\r\n", "\n");
                 if (content.contains(searchText)) {
-                    return "old_code was found in pinned file '" + pinned + "' " +
-                           "— you specified the wrong file_path. Use file_path='" + pinned + "'.\n";
+                    return "anchor found in pinned file '" + pinned + "' — wrong file_path was used. "
+                         + "Next action: use file_path=\"" + pinned + "\" and retry with the same old_code.\n";
                 }
             } catch (IOException ignored) {}
         }
@@ -234,7 +247,7 @@ public class ReplaceInFileTool implements AgentTool {
         } catch (IOException ignored) {}
 
         if (found.isEmpty()) return "";
-        return "Hint: old_code was found in " + found + " — did you mean one of those files?\n";
+        return "anchor found in project files: " + found + "\n";
     }
 
     private static String truncate(String text, int maxLines) {

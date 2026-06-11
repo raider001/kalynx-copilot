@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="KalynxContextManager">
+    <option name="entries">
+      <list>
+        <WatchedEntry>
+          <option name="relativePath" value="Documentation/Project-Plan.md" />
+          <option name="source" value="AI" />
+        </WatchedEntry>
+        <WatchedEntry>
+          <option name="relativePath" value="Documentation/Implementation-Roadmap.md" />
+          <option name="source" value="AI" />
+        </WatchedEntry>
+      </list>
+    </option>
+  </component>
+</project>

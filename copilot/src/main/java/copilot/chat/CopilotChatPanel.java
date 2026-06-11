@@ -1654,7 +1654,7 @@ public class CopilotChatPanel extends JPanel {
         scroll.getViewport().setBackground(new Color(0x1E, 0x1E, 0x1E));
         scroll.setPreferredSize(new Dimension(800, 600));
 
-        JLabel statusLabel = new JLabel(String.format("  %,d chars — live", initial.length()));
+        JLabel statusLabel = new JLabel(String.format("  %,d chars (~%,d tokens) — live", initial.length(), initial.length() / 4));
         statusLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
         statusLabel.setForeground(STATUS_FG);
         statusLabel.setBorder(BorderFactory.createEmptyBorder(4, 0, 0, 0));
@@ -1686,7 +1686,7 @@ public class CopilotChatPanel extends JPanel {
                     vBar.setValue(vVal);
                     hBar.setValue(hVal);
                 });
-                statusLabel.setText(String.format("  %,d chars — live", current.length()));
+                statusLabel.setText(String.format("  %,d chars (~%,d tokens) — live", current.length(), current.length() / 4));
             }
         });
         refreshTimer.start();

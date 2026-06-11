@@ -73,9 +73,23 @@ public class RunTestsTool implements AgentTool {
         boolean isGradle = new File(projectDir, "build.gradle").exists()
                         || new File(projectDir, "build.gradle.kts").exists();
 
-        if (isMaven)  return runMaven(filter, projectDir);
-        if (isGradle) return runGradle(filter, projectDir);
-        return "Error: No pom.xml or build.gradle / build.gradle.kts found in project root.";
+        String result;
+        if (isMaven)       result = runMaven(filter, projectDir);
+        else if (isGradle) result = runGradle(filter, projectDir);
+        else               return "Error: No pom.xml or build.gradle / build.gradle.kts found in project root.";
+
+        if (!result.startsWith("Error:")) {
+            boolean passed     = result.contains("All tests passed.")
+                              || (result.contains("BUILD: SUCCESSFUL") && !result.contains("FAIL:"));
+            int errorCount     = 0;
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("RESULTS: \\d+ passed, (\\d+) failed, (\\d+) error").matcher(result);
+            if (m.find()) errorCount = Integer.parseInt(m.group(1)) + Integer.parseInt(m.group(2));
+            else if (!passed) errorCount = 1;
+            copilot.context.ContextManager.getInstance(project).getPhaseController()
+                    .notifyVerifyResult(passed, errorCount, result);
+        }
+        return result;
     }
 
     // ── Maven ─────────────────────────────────────────────────────────────────
